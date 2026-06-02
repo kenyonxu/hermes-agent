@@ -173,6 +173,22 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ---
 
+## Plugin Streaming Fix (Merged ✅)
+
+Plugins using `transform_llm_output` hooks can now deliver their transformed output through streaming platforms (Discord, Telegram, ACP, etc.). Previously, plugin output was silently discarded after streaming completed. Thanks to [PR #31433](https://github.com/NousResearch/hermes-agent/pull/31433) by [@kenyonxu](https://github.com/kenyonxu) and [@teknium1](https://github.com/teknium1).
+
+<p align="center">
+  <img src="https://camo.githubusercontent.com/353ef986e511fa4e496b63a6c08111295601c04fdc64a944cc1590dd96c6234e/68747470733a2f2f7633622e66616c2e6d656469612f66696c65732f622f30613962376366382f6b6665553069716b67546c7355767847527577466a5f5a616d39596b48622e706e67" alt="Hermes Agent Plugin Streaming Fix Infographic" width="80%">
+</p>
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `transform_llm_output` hook on streaming platforms | silently dropped | edited into the streamed message |
+| `transform_llm_output` hook via ACP | dropped when streamed | delivered as final message |
+| Normal streaming (no transform) | unchanged | unchanged |
+
+---
+
 ## Contributing
 
 We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
