@@ -7,7 +7,7 @@ housekeeping) and the housekeeping DB-governance tick so the scheduler cannot
 silently regress.
 """
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 def test_try_wal_checkpoint_default_is_passive():
@@ -44,23 +44,16 @@ def test_try_wal_checkpoint_truncate_opt_in():
     assert "TRUNCATE" in captured["sql"]
 
 
-def test_housekeeping_invokes_prune_and_archive():
-    """Housekeeping DB prune tick must invoke prune_sessions + archive_sessions + vacuum."""
+def _drive_housekeeping_once(session_db):
+    """Run the housekeeping loop far enough for the DB-governance tick to fire.
+
+    DB_GOV_EVERY == 60, and each loop iteration bumps tick_count once, so we let
+    it reach a multiple of 60 before stopping. interval is tiny (0.01s) so the
+    ~60 iterations complete in well under a second.
+    """
     import gateway.run as run_mod
 
     stop = threading.Event()
-    raw_db = MagicMock()
-    raw_db.prune_sessions = MagicMock(return_value=0)
-    raw_db.archive_sessions = MagicMock(return_value=0)
-    raw_db.vacuum = MagicMock(return_value=0)
-    raw_db._try_wal_checkpoint = MagicMock()
-    session_db = MagicMock()
-    session_db._db = raw_db
-
-    # Drive the loop far enough that the DB-governance tick (DB_GOV_EVERY == 60)
-    # actually fires. Each loop iteration bumps tick_count once, so we must let
-    # it reach a multiple of 60 before stopping. interval is tiny (0.01s) so the
-    # ~60 iterations complete in well under a second.
     counter = {"n": 0}
     orig_wait = stop.wait
 
@@ -76,5 +69,37 @@ def test_housekeeping_invokes_prune_and_archive():
         stop, adapters=None, loop=None, interval=0.01, session_db=session_db
     )
 
-    raw_db.archive_sessions.assert_called()
-    raw_db.prune_sessions.assert_called()
+
+def test_housekeeping_invokes_auto_prune_when_enabled():
+    """With sessions.auto_prune enabled, the DB-governance tick must delegate to
+    the config-gated maybe_auto_prune_and_vacuum facility."""
+    raw_db = MagicMock()
+    raw_db.maybe_auto_prune_and_vacuum = MagicMock(
+        return_value={"skipped": False, "pruned": 3, "vacuumed": True}
+    )
+    raw_db._try_wal_checkpoint = MagicMock()
+    session_db = MagicMock()
+    session_db._db = raw_db
+
+    cfg = {"sessions": {"auto_prune": True, "retention_days": 90}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        _drive_housekeeping_once(session_db)
+
+    raw_db.maybe_auto_prune_and_vacuum.assert_called()
+
+
+def test_housekeeping_skips_prune_when_disabled():
+    """With sessions.auto_prune disabled (default), the DB-governance tick must
+    NOT touch the DB — no silent archive/prune/vacuum."""
+    raw_db = MagicMock()
+    raw_db.maybe_auto_prune_and_vacuum = MagicMock()
+    raw_db._try_wal_checkpoint = MagicMock()
+    session_db = MagicMock()
+    session_db._db = raw_db
+
+    cfg = {"sessions": {"auto_prune": False}}
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        _drive_housekeeping_once(session_db)
+
+    raw_db.maybe_auto_prune_and_vacuum.assert_not_called()
+

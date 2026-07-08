@@ -19710,8 +19710,8 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
     WAL_CHECKPOINT_EVERY = 60  # ticks — hourly TRUNCATE on the off-loop housekeeping thread
-    DB_GOV_EVERY = 60          # ticks — hourly prune/archive/vacuum
-    DB_RETENTION_DAYS = 90
+    DB_GOV_EVERY = 60          # ticks — hourly check (actual maintenance gated
+                               # by maybe_auto_prune_and_vacuum's own idempotency)
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
@@ -19727,19 +19727,24 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                 logger.debug("WAL checkpoint housekeeping error: %s", e)
 
         if tick_count % DB_GOV_EVERY == 0 and session_db is not None:
+            # Route DB governance through the config-gated facility instead of
+            # calling archive/prune/vacuum unconditionally. This honors the
+            # sessions.auto_prune opt-in, config retention, cross-process
+            # idempotency (state_meta last_auto_prune), and only vacuums when
+            # rows were actually pruned — so we never hold self._lock for a
+            # minutes-long rewrite of a large DB and starve the thread pool.
             try:
-                raw = getattr(session_db, "_db", session_db)
-                archived = raw.archive_sessions(older_than_days=DB_RETENTION_DAYS)
-                pruned = raw.prune_sessions(older_than_days=DB_RETENTION_DAYS)
-                if archived or pruned:
-                    logger.info(
-                        "Housekeeping DB gov: archived=%s pruned=%s (retention=%dd)",
-                        archived, pruned, DB_RETENTION_DAYS,
+                from hermes_cli.config import load_config as _load_full_config
+                _sess_cfg = (_load_full_config().get("sessions") or {})
+                if _sess_cfg.get("auto_prune", False):
+                    raw = getattr(session_db, "_db", session_db)
+                    _r = raw.maybe_auto_prune_and_vacuum(
+                        retention_days=int(_sess_cfg.get("retention_days", 90)),
+                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
                     )
-                # vacuum occasionally (every 24 DB gov ticks ≈ daily)
-                if tick_count % (DB_GOV_EVERY * 24) == 0:
-                    raw.vacuum()
-                    logger.info("Housekeeping: vacuum done")
+                    if _r and not _r.get("skipped"):
+                        logger.info("Housekeeping DB gov: %s", _r)
             except Exception as e:
                 logger.debug("Housekeeping DB governance error: %s", e)
 
