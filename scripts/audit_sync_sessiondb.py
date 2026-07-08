@@ -32,13 +32,37 @@ class Finding:
         return f"{self.filename}:{self.lineno} {self.detail}"
 
 
+def _receiver_is_db_like(value: ast.expr) -> bool:
+    """True when the call receiver looks like a SessionDB handle (name contains 'db')."""
+    if isinstance(value, ast.Name):
+        return "db" in value.id.lower()
+    if isinstance(value, ast.Attribute):
+        return "db" in value.attr.lower()
+    return False
+
+
 def _is_sync_db_call(node: ast.Call) -> bool:
-    """node.func is an x.method(...) and method name matches a sync prefix."""
+    """node.func is an x.method(...), method matches a sync prefix, and x is a db-like handle."""
     func = node.func
     if not isinstance(func, ast.Attribute):
         return False
     name = func.attr
-    return any(name.startswith(p) or name == p.rstrip("_") for p in SYNC_METHOD_PREFIXES)
+    if not any(name.startswith(p) or name == p.rstrip("_") for p in SYNC_METHOD_PREFIXES):
+        return False
+    return _receiver_is_db_like(func.value)
+
+
+def _uses_to_thread(node: ast.AST) -> bool:
+    """True when the function body contains an asyncio.to_thread(...) call anywhere."""
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        f = sub.func
+        if isinstance(f, ast.Attribute) and f.attr == "to_thread":
+            return True
+        if isinstance(f, ast.Name) and f.id == "to_thread":
+            return True
+    return False
 
 
 def _line_has_safe_marker(source_lines: List[str], lineno: int) -> bool:
@@ -60,6 +84,7 @@ def scan_source(source: str, filename: str = "<src>") -> List[Finding]:
         if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
             continue
         is_async = isinstance(node, ast.AsyncFunctionDef)
+        func_uses_to_thread = _uses_to_thread(node)
         for sub in ast.walk(node):
             if not isinstance(sub, ast.Call):
                 continue
@@ -73,6 +98,7 @@ def scan_source(source: str, filename: str = "<src>") -> List[Finding]:
                 and isinstance(sub.args[1], ast.Constant)
                 and sub.args[1].value == "_db"
                 and is_async
+                and not func_uses_to_thread
             ):
                 findings.append(Finding(
                     filename, sub.lineno,
