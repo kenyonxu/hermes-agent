@@ -1191,33 +1191,30 @@ class SessionDB:
             "database is locked after max retries"
         )
 
-    def _try_wal_checkpoint(self) -> None:
-        """Best-effort TRUNCATE WAL checkpoint.  Never raises.
+    def _try_wal_checkpoint(self, truncate: bool = False) -> None:
+        """Best-effort WAL checkpoint.  Never raises.
 
-        Flushes committed WAL frames back into the main DB file and
-        truncates the WAL file to zero bytes.  Keeps the WAL from
-        growing unbounded when many processes hold persistent
-        connections.
+        Defaults to PASSIVE (non-blocking) for the write hot path.
+        When ``truncate=True``, uses TRUNCATE to recover the WAL
+        high-water mark — this may block for seconds-to-minutes on
+        large databases and MUST only be called from the off-loop
+        housekeeping thread (periodic, hourly).
 
-        PASSIVE checkpoint was previously used here, but it never
-        truncates the WAL file — the file stays at its high-water
-        mark until an explicit TRUNCATE is called (which only
-        happened inside the infrequent vacuum()).
-
-        TRUNCATE may block writers briefly while checkpointing, but
-        _try_wal_checkpoint is called off the hot path (every 50
-        writes) and already runs under ``self._lock``, so the
-        additional hold time is negligible.
+        Flushes committed WAL frames back into the main DB file.
+        PASSIVE never truncates the WAL file — the file stays at its
+        high-water mark — so TRUNCATE is still needed periodically
+        to keep disk usage bounded.
         """
+        mode = "TRUNCATE" if truncate else "PASSIVE"
         try:
             with self._lock:
                 result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                    f"PRAGMA wal_checkpoint({mode})"
                 ).fetchone()
                 if result and result[1] > 0:
                     logger.debug(
-                        "WAL checkpoint: %d/%d pages checkpointed",
-                        result[2], result[1],
+                        "WAL checkpoint(%s): %d/%d pages checkpointed",
+                        mode, result[2], result[1],
                     )
         except Exception:
             pass  # Best effort — never fatal.

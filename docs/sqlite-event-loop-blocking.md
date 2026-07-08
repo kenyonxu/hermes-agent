@@ -70,6 +70,19 @@ Hermes Gateway 是 asyncio 应用。它的消息处理、平台心跳、cron 调
 
 ---
 
+## 完成状态(2026-07-08)
+
+| 项 | 状态 |
+| --- | --- |
+| #5 `_session_has_compression_in_flight` 双阻塞源 offload | ✅ Task 1 |
+| AST 扫描器 + unwrap 专项 + CI 门禁 | ✅ Task 2 / Task 6 |
+| WAL TRUNCATE 移出写热路径 | ✅ Task 3 |
+| housekeeping 定期 prune/archive/vacuum | ✅ Task 4 |
+| 事件循环阻塞回归门禁 | ✅ Task 5 |
+| P2b/c(SessionStore + sessions.json async 化) | ⏸ 推迟到上游 #23717 |
+
+---
+
 ## 4. 行动方案
 
 ### 短期：修复 #5

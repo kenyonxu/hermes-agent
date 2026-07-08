@@ -5023,7 +5023,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return False
 
-    def _session_has_compression_in_flight(self, session_key: str) -> bool:
+    async def _session_has_compression_in_flight(self, session_key: str) -> bool:
         """Return True when a compression lock is held for this session's id.
 
         Context compression is interrupt-protected (#23975) but gateway
@@ -5031,27 +5031,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the pre-rotation parent while compression is mid-flight, producing
         orphaned compression siblings (#56391). Callers demote interrupt to
         queue when this returns True.
+
+        Both blocking sources — the ``session_store`` lock + JSON load, and the
+        SQLite ``get_compression_lock_holder`` SELECT — are offloaded to a
+        worker thread so a large state.db never freezes the event loop (#5).
         """
         session_store = getattr(self, "session_store", None)
         if not session_key or session_store is None:
             return False
         try:
-            with session_store._lock:  # noqa: SLF001 — snapshot entry under lock
-                session_store._ensure_loaded_locked()  # noqa: SLF001
-                entry = session_store._entries.get(session_key)  # noqa: SLF001
-            session_id = getattr(entry, "session_id", None) if entry is not None else None
-            if not session_id:
-                return False
+            session_id = await asyncio.to_thread(
+                self._lookup_session_id_under_store_lock, session_store, session_key
+            )
         except Exception:
+            return False
+        if not session_id:
             return False
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return False
-        db = getattr(session_db, "_db", session_db)
+        raw_db = getattr(session_db, "_db", session_db)
         try:
-            return bool(db.get_compression_lock_holder(str(session_id)))
+            holder = await asyncio.to_thread(
+                raw_db.get_compression_lock_holder, str(session_id)
+            )
+            return bool(holder)
         except Exception:
             return False
+
+    @staticmethod
+    def _lookup_session_id_under_store_lock(session_store, session_key: str):
+        """Sync helper run in the thread pool: read session_id under the store lock."""
+        # noqa: SLF001 — intentional private access; runs off the event loop.
+        with session_store._lock:  # noqa: SLF001
+            session_store._ensure_loaded_locked()  # noqa: SLF001
+            entry = session_store._entries.get(session_key)  # noqa: SLF001
+        return getattr(entry, "session_id", None) if entry is not None else None
 
     # Hard cap on per-session pending follow-ups for busy_input_mode=queue
     # (and the draining/steer-fallback/subagent-demotion paths that share
@@ -5275,7 +5290,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             effective_mode = "queue"
         demoted_for_compression = (
             effective_mode == "interrupt"
-            and self._session_has_compression_in_flight(session_key)
+            and await self._session_has_compression_in_flight(session_key)
         )
         if demoted_for_compression:
             logger.info(
@@ -19673,7 +19688,7 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, session_db=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -19694,11 +19709,44 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
+    WAL_CHECKPOINT_EVERY = 60  # ticks — hourly TRUNCATE on the off-loop housekeeping thread
+    DB_GOV_EVERY = 60          # ticks — hourly check (actual maintenance gated
+                               # by maybe_auto_prune_and_vacuum's own idempotency)
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        if tick_count % WAL_CHECKPOINT_EVERY == 0 and session_db is not None:
+            try:
+                raw = getattr(session_db, "_db", session_db)
+                raw._try_wal_checkpoint(truncate=True)
+                logger.debug("Housekeeping: WAL TRUNCATE checkpoint done")
+            except Exception as e:
+                logger.debug("WAL checkpoint housekeeping error: %s", e)
+
+        if tick_count % DB_GOV_EVERY == 0 and session_db is not None:
+            # Route DB governance through the config-gated facility instead of
+            # calling archive/prune/vacuum unconditionally. This honors the
+            # sessions.auto_prune opt-in, config retention, cross-process
+            # idempotency (state_meta last_auto_prune), and only vacuums when
+            # rows were actually pruned — so we never hold self._lock for a
+            # minutes-long rewrite of a large DB and starve the thread pool.
+            try:
+                from hermes_cli.config import load_config as _load_full_config
+                _sess_cfg = (_load_full_config().get("sessions") or {})
+                if _sess_cfg.get("auto_prune", False):
+                    raw = getattr(session_db, "_db", session_db)
+                    _r = raw.maybe_auto_prune_and_vacuum(
+                        retention_days=int(_sess_cfg.get("retention_days", 90)),
+                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                    )
+                    if _r and not _r.get("skipped"):
+                        logger.info("Housekeeping DB gov: %s", _r)
+            except Exception as e:
+                logger.debug("Housekeeping DB governance error: %s", e)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
@@ -20292,7 +20340,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(), "session_db": runner._session_db},
         daemon=True,
         name="gateway-housekeeping",
     )
