@@ -94,6 +94,10 @@ jobs:
         # re-download, keeping the persisted cache small and fast to restore.
         run: uv cache prune --ci
 
+      - name: Audit sync SessionDB calls (event-loop blocking gate)
+        continue-on-error: true
+        run: python scripts/audit_sync_sessiondb.py gateway/ cron/ tools/
+
       - name: Run tests (slice ${{ matrix.slice.index }}/${{ inputs.slice_count }})
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess
