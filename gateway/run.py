@@ -19709,6 +19709,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
+    WAL_CHECKPOINT_EVERY = 60  # ticks — hourly TRUNCATE on the off-loop housekeeping thread
     DB_GOV_EVERY = 60          # ticks — hourly prune/archive/vacuum
     DB_RETENTION_DAYS = 90
 
@@ -19716,6 +19717,14 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        if tick_count % WAL_CHECKPOINT_EVERY == 0 and session_db is not None:
+            try:
+                raw = getattr(session_db, "_db", session_db)
+                raw._try_wal_checkpoint(truncate=True)
+                logger.debug("Housekeeping: WAL TRUNCATE checkpoint done")
+            except Exception as e:
+                logger.debug("WAL checkpoint housekeeping error: %s", e)
 
         if tick_count % DB_GOV_EVERY == 0 and session_db is not None:
             try:

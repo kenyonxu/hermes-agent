@@ -1,12 +1,47 @@
-"""Root-cause tests: housekeeping DB governance (prune/archive/vacuum scheduling).
+"""Root-cause tests: WAL checkpoint strategy + housekeeping DB governance.
 
 state.db bloated to 1.4GB / 145983 messages because SessionDB had
 prune_sessions/archive_sessions/vacuum but nothing ever scheduled them. These
-tests pin the housekeeping DB-governance tick so the scheduler cannot silently
-regress back to never calling them.
+tests pin both the WAL checkpoint strategy (PASSIVE hot path vs TRUNCATE
+housekeeping) and the housekeeping DB-governance tick so the scheduler cannot
+silently regress.
 """
 import threading
 from unittest.mock import MagicMock
+
+
+def test_try_wal_checkpoint_default_is_passive():
+    """Hot path defaults to PASSIVE (non-blocking), NOT TRUNCATE."""
+    import hermes_state
+    db = hermes_state.SessionDB.__new__(hermes_state.SessionDB)
+    db._lock = threading.Lock()
+    db._conn = MagicMock()
+    captured = {}
+    def fake_execute(sql, *a, **kw):
+        captured["sql"] = sql
+        class _Res:
+            def fetchone(self): return [0, 0, 0]
+        return _Res()
+    db._conn.execute = fake_execute
+    db._try_wal_checkpoint()
+    assert "PASSIVE" in captured["sql"], "Hot path checkpoint MUST default to PASSIVE"
+    assert "TRUNCATE" not in captured["sql"]
+
+
+def test_try_wal_checkpoint_truncate_opt_in():
+    import hermes_state
+    db = hermes_state.SessionDB.__new__(hermes_state.SessionDB)
+    db._lock = threading.Lock()
+    db._conn = MagicMock()
+    captured = {}
+    def fake_execute(sql, *a, **kw):
+        captured["sql"] = sql
+        class _Res:
+            def fetchone(self): return [0, 0, 0]
+        return _Res()
+    db._conn.execute = fake_execute
+    db._try_wal_checkpoint(truncate=True)
+    assert "TRUNCATE" in captured["sql"]
 
 
 def test_housekeeping_invokes_prune_and_archive():
