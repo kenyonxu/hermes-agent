@@ -19688,7 +19688,7 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, session_db=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -19709,11 +19709,30 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
+    DB_GOV_EVERY = 60          # ticks — hourly prune/archive/vacuum
+    DB_RETENTION_DAYS = 90
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        if tick_count % DB_GOV_EVERY == 0 and session_db is not None:
+            try:
+                raw = getattr(session_db, "_db", session_db)
+                archived = raw.archive_sessions(older_than_days=DB_RETENTION_DAYS)
+                pruned = raw.prune_sessions(older_than_days=DB_RETENTION_DAYS)
+                if archived or pruned:
+                    logger.info(
+                        "Housekeeping DB gov: archived=%s pruned=%s (retention=%dd)",
+                        archived, pruned, DB_RETENTION_DAYS,
+                    )
+                # vacuum occasionally (every 24 DB gov ticks ≈ daily)
+                if tick_count % (DB_GOV_EVERY * 24) == 0:
+                    raw.vacuum()
+                    logger.info("Housekeeping: vacuum done")
+            except Exception as e:
+                logger.debug("Housekeeping DB governance error: %s", e)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
@@ -20307,7 +20326,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(), "session_db": runner._session_db},
         daemon=True,
         name="gateway-housekeeping",
     )
