@@ -122,29 +122,42 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     for platform, adapter in adapters.items():
         try:
             if platform == Platform.DISCORD:
-                platforms["discord"] = await _build_discord(adapter)
+                platforms["discord"] = await asyncio.to_thread(_build_discord, adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
     # Platforms that don't support direct channel enumeration get session-based
-    # discovery automatically.  Skip infrastructure entries that aren't messaging
-    # platforms — everything else falls through to _build_from_sessions().
+    # discovery automatically, but only for platforms connected in THIS gateway
+    # process. Historical session origins for disabled/decommissioned platforms
+    # must not be resurrected into the active send-target directory (stale
+    # targets make send_message route to platforms that can no longer deliver).
     _SKIP_SESSION_DISCOVERY = frozenset({"local", "api_server", "webhook"})
+    adapter_platform_names = {getattr(p, "value", str(p)) for p in adapters}
     for plat in Platform:
         plat_name = plat.value
-        if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
+        if (
+            plat_name in _SKIP_SESSION_DISCOVERY
+            or plat_name in platforms
+            or plat_name not in adapter_platform_names
+        ):
             continue
-        platforms[plat_name] = await _build_from_sessions(plat_name)
+        platforms[plat_name] = await asyncio.to_thread(_build_from_sessions, plat_name)
 
     # Include plugin-registered platforms (dynamic enum members aren't in
-    # Platform.__members__, so the loop above misses them).
+    # Platform.__members__, so the loop above misses them). Same
+    # connected-only rule: don't expose stale session targets for plugins
+    # that are not loaded.
     try:
         from gateway.platform_registry import platform_registry
         for entry in platform_registry.plugin_entries():
-            if entry.name not in _SKIP_SESSION_DISCOVERY and entry.name not in platforms:
-                platforms[entry.name] = await _build_from_sessions(entry.name)
+            if (
+                entry.name not in _SKIP_SESSION_DISCOVERY
+                and entry.name not in platforms
+                and entry.name in adapter_platform_names
+            ):
+                platforms[entry.name] = await asyncio.to_thread(_build_from_sessions, entry.name)
     except Exception:
         pass
 
@@ -164,7 +177,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     return directory
 
 
-async def _build_discord(adapter) -> List[Dict[str, str]]:
+def _build_discord(adapter) -> List[Dict[str, str]]:
     """Enumerate all text channels and forum channels the Discord bot can see."""
     channels = []
     client = getattr(adapter, "_client", None)
@@ -197,7 +210,7 @@ async def _build_discord(adapter) -> List[Dict[str, str]]:
         # feasible via guild enumeration; those come from sessions.
 
     # Merge any DMs from session history
-    channels.extend(await _build_from_sessions("discord"))
+    channels.extend(_build_from_sessions("discord"))
     return channels
 
 
@@ -211,7 +224,7 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     """
     team_clients = getattr(adapter, "_team_clients", None) or {}
     if not team_clients:
-        return await _build_from_sessions("slack")
+        return await asyncio.to_thread(_build_from_sessions, "slack")
 
     channels: List[Dict[str, Any]] = []
     seen_ids: set = set()
@@ -255,7 +268,7 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
             continue
 
     # Merge in DM/group entries discovered from session history.
-    for entry in await _build_from_sessions("slack"):
+    for entry in await asyncio.to_thread(_build_from_sessions, "slack"):
         if entry.get("id") not in seen_ids:
             channels.append(entry)
             seen_ids.add(entry.get("id"))
@@ -263,16 +276,16 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
     return channels
 
 
-async def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
+def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
     """Pull known channels/contacts from gateway session origin data.
 
     state.db is the primary source (#9006): gateway session rows persist
     origin_json.  Falls back to sessions.json for pre-migration databases.
     """
-    entries = await asyncio.to_thread(_build_from_sessions_db, platform_name)
+    entries = _build_from_sessions_db(platform_name)
     if entries:
         return entries
-    return await asyncio.to_thread(_build_from_sessions_json, platform_name)
+    return _build_from_sessions_json(platform_name)
 
 
 def _build_from_sessions_db(platform_name: str) -> List[Dict[str, str]]:
@@ -280,7 +293,7 @@ def _build_from_sessions_db(platform_name: str) -> List[Dict[str, str]]:
     entries: List[Dict[str, str]] = []
     try:
         from hermes_state import SessionDB
-        db = SessionDB(read_only=True)
+        db = SessionDB()
         try:
             lister = getattr(db, "list_gateway_sessions", None)
             if not callable(lister):

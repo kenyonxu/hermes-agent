@@ -8,6 +8,7 @@ Handles:
 - Dynamic system prompt injection (agent knows its context)
 """
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -111,10 +112,35 @@ def _is_path_unsafe(value: object) -> bool:
     s = str(value)
     if ".." in s or "/" in s or "\\" in s:
         return True
-    # Leading Windows drive path, e.g. "C:\..." or "d:/...". A bare "x:"
+    # Leading Windows drive path, e.g. "C:\\..." or "d:/...". A bare "x:"
     # with no following separator isn't a usable absolute path, and the
     # separator forms are already caught above — but keep an explicit guard
     # for the drive-letter prefix in case a separator was normalized away.
+    return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
+
+
+def _is_session_key_unsafe(value: object) -> bool:
+    """Return True if ``value`` could be a real traversal vector in a session_key.
+
+    ``session_key`` is a *logical* routing key (e.g.
+    ``agent:main:google_chat:group:spaces/<id>``) — it never touches the
+    filesystem, so the strict separator-rejecting guard from
+    ``_is_path_unsafe`` is over-broad: it falsely rejects Google Chat
+    resource names (``spaces/<id>``, ``spaces/<id>/threads/<id>``) and any
+    other platform whose native IDs legitimately contain ``/``.
+
+    The relaxed check only blocks genuine traversal: parent-dir ``..``,
+    a *leading* path separator (``/``/``\\``, which would make the key
+    absolute on disk if it ever were written), and a leading Windows
+    drive letter. Interior ``/`` is allowed.
+    """
+    if not value:
+        return False
+    s = str(value)
+    if ".." in s:
+        return True
+    if s.startswith("/") or s.startswith("\\"):
+        return True
     return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
 
 
@@ -155,6 +181,14 @@ class SessionSource:
     # None => the gateway's active/default profile. Drives both session-key
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
+
+    # Discord auto-thread metadata.  Newly auto-created Discord threads start
+    # with a fast placeholder title from the raw message, then the gateway can
+    # rename them after the first agent turn using the generated session title.
+    # Keep this explicit so pre-existing or human-renamed threads are not
+    # mistaken for safe rename targets.
+    auto_thread_created: bool = False
+    auto_thread_initial_name: Optional[str] = None
 
     # Internal, wire-INVISIBLE trust signal: True when this event was delivered
     # to the gateway over the per-instance-authenticated relay WebSocket (the
@@ -229,6 +263,10 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.auto_thread_created:
+            d["auto_thread_created"] = True
+        if self.auto_thread_initial_name:
+            d["auto_thread_initial_name"] = self.auto_thread_initial_name
         return d
 
     @classmethod
@@ -250,6 +288,8 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            auto_thread_created=bool(data.get("auto_thread_created", False)),
+            auto_thread_initial_name=data.get("auto_thread_initial_name"),
         )
     
 
@@ -741,12 +781,21 @@ class SessionEntry:
         session_key = data["session_key"]
         session_id = data["session_id"]
 
-        # Validate path-sensitive fields to prevent directory traversal (CWE-22)
-        for _field, _val in (("session_key", session_key), ("session_id", session_id)):
-            if _is_path_unsafe(_val):
-                raise ValueError(
-                    f"Invalid {_field}: potential directory traversal detected"
-                )
+        # Validate path-sensitive fields to prevent directory traversal (CWE-22).
+        # ``session_id`` is the value used as a filename
+        # (``sessions_dir / f"{session_id}.json"``), so it must pass the strict
+        # guard. ``session_key`` is a *logical* routing key that never touches
+        # the filesystem — interior ``/`` is legitimate (Google Chat resource
+        # names are ``spaces/<id>`` and ``spaces/<id>/threads/<id>``), so it
+        # only needs the relaxed guard against genuine traversal vectors.
+        if _is_path_unsafe(session_id):
+            raise ValueError(
+                "Invalid session_id: potential directory traversal detected"
+            )
+        if _is_session_key_unsafe(session_key):
+            raise ValueError(
+                "Invalid session_key: potential directory traversal detected"
+            )
 
         return cls(
             session_key=session_key,
@@ -910,6 +959,30 @@ def build_session_key(
     return ":".join(key_parts)
 
 
+class _SessionFlight:
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: Optional["SessionEntry"] = None
+        self.error: Optional[BaseException] = None
+
+
+class AsyncSessionStore:
+    """Async boundary for the synchronous, thread-safe SessionStore."""
+
+    def __init__(self, store: "SessionStore") -> None:
+        self._store = store
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._store, name)
+        if not callable(attr):
+            return attr
+
+        async def _offloaded(*args, **kwargs) -> Any:
+            return await asyncio.to_thread(attr, *args, **kwargs)
+
+        return _offloaded
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
@@ -925,6 +998,14 @@ class SessionStore:
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
         self._lock = threading.Lock()
+        # Serialize whole-index persistence without holding ``_lock`` across
+        # SQLite / fsync. Each writer snapshots the latest state only after
+        # acquiring this lock, preventing stale delayed writes.
+        self._save_lock = threading.Lock()
+        self._routing_generation = 0
+        self._persisted_routing_generation = 0
+        self._inflight_lock = threading.Lock()
+        self._inflight_sessions: Dict[str, _SessionFlight] = {}
         self._has_active_processes_fn = has_active_processes_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
@@ -1131,40 +1212,45 @@ class SessionStore:
             self._save()
 
     def _save(self) -> None:
-        """Persist the routing index (session key -> ID mapping).
+        """Persist the routing index while the caller holds ``_lock``."""
+        data, generation = self._snapshot_routing_locked()
+        self._persist_routing_data(data, generation)
 
-        state.db's ``gateway_routing`` table is the primary store (#9006
-        follow-up): the whole index is replaced atomically in one SQLite
-        transaction, mirroring the previous full-file JSON rewrite semantics.
+    def _snapshot_routing_locked(self) -> tuple[Dict[str, Any], int]:
+        """Capture immutable routing data and a monotonic generation."""
+        self._routing_generation = getattr(self, "_routing_generation", 0) + 1
+        return (
+            {key: entry.to_dict() for key, entry in self._entries.items()},
+            self._routing_generation,
+        )
 
-        sessions.json is additionally written for backward compatibility
-        (external tooling, downgrade safety) unless the user disables it via
-        ``gateway.write_sessions_json: false`` in config.yaml.
-        """
-        data = {key: entry.to_dict() for key, entry in self._entries.items()}
-
-        # Primary: durable SQLite routing table.
-        db_saved = False
-        _db = getattr(self, "_db", None)
-        if _db:
-            replacer = getattr(_db, "replace_gateway_routing_entries", None)
-            if callable(replacer):
-                try:
-                    replacer(
-                        {k: json.dumps(v) for k, v in data.items()},
-                        scope=self._routing_scope(),
-                    )
-                    db_saved = True
-                except Exception as exc:
-                    logger.warning(
-                        "gateway.session: state.db routing save failed: %s", exc
-                    )
-
-        # Legacy mirror: sessions.json. Kept on by default for compat; when
-        # disabled we still fall back to it if the DB write failed, so the
-        # index is never lost entirely.
-        if getattr(self, "_write_sessions_json", True) or not db_saved:
-            self._save_sessions_json(data)
+    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+        """Serialize all whole-index writers through one durable write lock."""
+        save_lock = getattr(self, "_save_lock", None)
+        if save_lock is None:
+            save_lock = threading.Lock()
+            self._save_lock = save_lock
+        with save_lock:
+            if generation <= getattr(self, "_persisted_routing_generation", 0):
+                return
+            db_saved = False
+            _db = getattr(self, "_db", None)
+            if _db:
+                replacer = getattr(_db, "replace_gateway_routing_entries", None)
+                if callable(replacer):
+                    try:
+                        replacer(
+                            {k: json.dumps(v) for k, v in data.items()},
+                            scope=self._routing_scope(),
+                        )
+                        db_saved = True
+                    except Exception as exc:
+                        logger.warning(
+                            "gateway.session: state.db routing save failed: %s", exc
+                        )
+            if getattr(self, "_write_sessions_json", True) or not db_saved:
+                self._save_sessions_json(data)
+            self._persisted_routing_generation = generation
 
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""
@@ -1206,34 +1292,11 @@ class SessionStore:
                 logger.debug("Could not remove temp file %s: %s", tmp_path, e)
             raise
     
-    def _save_entries(self, entries_snapshot: Dict[str, "SessionEntry"]) -> None:
-        """Persist a caller-captured snapshot of entries (callable off-lock).
-
-        Same write logic as :meth:`_save` but operates on a snapshot dict
-        instead of reading ``self._entries`` live.  This avoids
-        ``RuntimeError: dictionary changed size during iteration`` when
-        another thread mutates ``_entries`` concurrently.
-        """
-        data = {key: entry.to_dict() for key, entry in entries_snapshot.items()}
-
-        db_saved = False
-        _db = getattr(self, "_db", None)
-        if _db:
-            replacer = getattr(_db, "replace_gateway_routing_entries", None)
-            if callable(replacer):
-                try:
-                    replacer(
-                        {k: json.dumps(v) for k, v in data.items()},
-                        scope=self._routing_scope(),
-                    )
-                    db_saved = True
-                except Exception as exc:
-                    logger.warning(
-                        "gateway.session: state.db routing save failed: %s", exc
-                    )
-
-        if getattr(self, "_write_sessions_json", True) or not db_saved:
-            self._save_sessions_json(data)
+    def _save_entries(self) -> None:
+        """Snapshot latest state under ``_lock`` and persist after releasing it."""
+        with self._lock:
+            data, generation = self._snapshot_routing_locked()
+        self._persist_routing_data(data, generation)
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
 
@@ -1252,6 +1315,45 @@ class SessionStore:
             return get_active_profile_name() or "default"
         except Exception:
             return None
+
+    @staticmethod
+    def _profile_from_session_key(session_key: Optional[str]) -> Optional[str]:
+        """Extract the profile namespace encoded in a gateway session key."""
+        if not session_key:
+            return None
+        parts = str(session_key).split(":")
+        if len(parts) < 2 or parts[0] != "agent":
+            return None
+        namespace = parts[1] or "main"
+        return "default" if namespace == "main" else namespace
+
+    @staticmethod
+    def _active_profile_name() -> str:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            return get_active_profile_name() or "default"
+        except Exception:
+            return "default"
+
+    def _recovered_row_allowed_for_active_profile(
+        self,
+        *,
+        requested_session_key: str,
+        recovered: Dict[str, Any],
+    ) -> bool:
+        """Prevent non-multiplexed gateways from reviving another profile's row."""
+        if getattr(self.config, "multiplex_profiles", False):
+            return True
+
+        recovered_key = str(recovered.get("session_key") or "")
+        if not recovered_key or recovered_key == requested_session_key:
+            return True
+
+        recovered_profile = self._profile_from_session_key(recovered_key)
+        if recovered_profile is None:
+            return True
+
+        return recovered_profile == self._active_profile_name()
 
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
@@ -1313,6 +1415,18 @@ class SessionStore:
             return None
         if not recovered:
             return None
+        if not self._recovered_row_allowed_for_active_profile(
+            requested_session_key=session_key,
+            recovered=recovered,
+        ):
+            logger.warning(
+                "Gateway session DB recovery ignored %s for %s because "
+                "multiplex_profiles is disabled and the row belongs to a "
+                "different profile",
+                recovered.get("session_key"),
+                session_key,
+            )
+            return None
         try:
             self._db.reopen_session(str(recovered["id"]))
         except Exception as exc:
@@ -1347,7 +1461,19 @@ class SessionStore:
             logger.debug("Gateway session DB recovery failed for %s: %s",
                          session_key, exc)
             return None
-        if not recovered:
+        if not isinstance(recovered, dict):
+            return None
+        if not self._recovered_row_allowed_for_active_profile(
+            requested_session_key=session_key,
+            recovered=recovered,
+        ):
+            logger.warning(
+                "Gateway session DB recovery ignored %s for %s because "
+                "multiplex_profiles is disabled and the row belongs to a "
+                "different profile",
+                recovered.get("session_key"),
+                session_key,
+            )
             return None
         try:
             self._db.reopen_session(str(recovered["id"]))
@@ -1649,15 +1775,58 @@ class SessionStore:
     def get_or_create_session(
         self,
         source: SessionSource,
-        force_new: bool = False
+        force_new: bool = False,
     ) -> SessionEntry:
-        """Get an existing session or create a new one.
+        """Single-flight session lookup/create per routing key.
 
-        Evaluates reset policy to determine if the existing session is stale.
-        Creates a session record in SQLite when a new session starts.
+        Calls for different keys remain concurrent. Overlapping calls for the
+        same key share the owner's result, including concurrent ``force_new``
+        deliveries, so only one routing transition and SQLite row is created.
+        """
+        session_key = self._generate_session_key(source)
+        inflight_lock = getattr(self, "_inflight_lock", None)
+        if inflight_lock is None:
+            inflight_lock = threading.Lock()
+            self._inflight_lock = inflight_lock
+            self._inflight_sessions = {}
+
+        with inflight_lock:
+            slot = self._inflight_sessions.get(session_key)
+            if slot is None:
+                slot = _SessionFlight()
+                self._inflight_sessions[session_key] = slot
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            slot.event.wait()
+            if slot.error is not None:
+                raise slot.error
+            assert slot.result is not None
+            return slot.result
+
+        try:
+            result = self._get_or_create_session_impl(source, force_new=force_new)
+            slot.result = result
+            return result
+        except BaseException as exc:
+            slot.error = exc
+            raise
+        finally:
+            slot.event.set()
+            with inflight_lock:
+                self._inflight_sessions.pop(session_key, None)
+
+    def _get_or_create_session_impl(
+        self,
+        source: SessionSource,
+        force_new: bool = False,
+    ) -> SessionEntry:
+        """Perform one session routing transition for the single-flight owner.
 
         All blocking I/O (SQLite SELECTs, routing-index rewrite + ``os.fsync``,
-        recovery DB queries) is performed *outside* ``self._lock``.  The lock
+        recovery DB queries) is performed *outside* ``self._lock``. The lock
         protects only ``_entries`` / ``_loaded`` mutations.
         """
         session_key = self._generate_session_key(source)
@@ -1666,6 +1835,7 @@ class SessionStore:
         db_end_session_id = None
         db_create_kwargs = None
         existing_session_id = None
+        force_new_observed_entry = None
 
         # ---- Phase 0: lock read -- existing session_id for compression tip ----
         if not force_new:
@@ -1687,6 +1857,8 @@ class SessionStore:
         _entry_for_checks = None
         with self._lock:
             self._ensure_loaded_locked()
+            if force_new:
+                force_new_observed_entry = self._entries.get(session_key)
             if session_key in self._entries and not force_new:
                 _entry_for_checks = self._entries[session_key]
                 _stale_session_id = _entry_for_checks.session_id
@@ -1694,7 +1866,7 @@ class SessionStore:
         # ---- Phase 1b: no-lock I/O -- stale check + reset policy ----
         _is_stale = False
         _reset_reason = None
-        if _entry_for_checks is not None:
+        if _entry_for_checks is not None and _stale_session_id is not None:
             _is_stale = self._is_session_ended_in_db(_stale_session_id)
             if _entry_for_checks.suspended:
                 _reset_reason = "suspended"
@@ -1714,7 +1886,6 @@ class SessionStore:
         # ---- Phase 2: lock write -- apply decisions to _entries ----
         _needs_save = False
         _needs_recover = False
-        _entries_snapshot: Optional[Dict[str, SessionEntry]] = None
         entry: Optional[SessionEntry] = None
         was_auto_reset = False
         auto_reset_reason = None
@@ -1768,24 +1939,25 @@ class SessionStore:
                 if not force_new:
                     _needs_recover = True
 
-            _entries_snapshot = dict(self._entries)
-
         # ---- Phase 3: no-lock I/O -- recovery + create + save + DB ops ----
-        if _needs_recover:
+        if _needs_recover and db_end_session_id is None:
             recovered = self._query_recoverable_session(
                 session_key=session_key, source=source, now=now,
             )
             if recovered is not None:
                 with self._lock:
-                    self._entries[session_key] = recovered
-                    _entries_snapshot = dict(self._entries)
-                entry = recovered
+                    published = self._entries.get(session_key)
+                    if published is None:
+                        self._entries[session_key] = recovered
+                        published = recovered
+                entry = published
                 _needs_save = True
 
         if entry is None:
-            # Create new session.
+            # Create a candidate outside the lock, then publish only if another
+            # worker has not already populated this routing key.
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-            entry = SessionEntry(
+            candidate = SessionEntry(
                 session_key=session_key,
                 session_id=session_id,
                 created_at=now,
@@ -1799,22 +1971,31 @@ class SessionStore:
                 reset_had_activity=reset_had_activity,
             )
             with self._lock:
-                self._entries[session_key] = entry
-                _entries_snapshot = dict(self._entries)
+                current = self._entries.get(session_key)
+                may_publish = current is None or (
+                    force_new and current is force_new_observed_entry
+                )
+                if may_publish:
+                    self._entries[session_key] = candidate
+                    published = candidate
+                else:
+                    published = current
+            assert published is not None
+            entry = published
             _needs_save = True
-            db_create_kwargs = {
-                "session_id": session_id,
-                "source": source.platform.value,
-                "user_id": source.user_id,
-                "session_key": session_key,
-                "chat_id": source.chat_id,
-                "chat_type": source.chat_type,
-                "thread_id": source.thread_id,
-            }
+            if entry is candidate:
+                db_create_kwargs = {
+                    "session_id": session_id,
+                    "source": source.platform.value,
+                    "user_id": source.user_id,
+                    "session_key": session_key,
+                    "chat_id": source.chat_id,
+                    "chat_type": source.chat_type,
+                    "thread_id": source.thread_id,
+                }
 
-        # Persist routing index from snapshot (was _save under lock).
-        if _needs_save and _entries_snapshot is not None:
-            self._save_entries(_entries_snapshot)
+        if _needs_save:
+            self._save_entries()
 
         # SQLite operations outside the lock (unchanged).
         if self._db and db_end_session_id:
