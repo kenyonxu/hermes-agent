@@ -925,7 +925,7 @@ class SessionDB:
                     f"file:{self.db_path}?mode=ro",
                     uri=True,
                     check_same_thread=False,
-                    timeout=1.0,
+                    timeout=30.0,
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
@@ -937,10 +937,14 @@ class SessionDB:
                 self._conn = sqlite3.connect(
                     str(self.db_path),
                     check_same_thread=False,
-                    # Short timeout — application-level retry with random
-                    # jitter handles contention instead of sitting in
-                    # SQLite's internal busy handler for up to 30s.
-                    timeout=1.0,
+                    # 30s busy timeout — waits patiently during write-lock
+                    # contention (e.g. concurrent cron jobs, handoff watcher,
+                    # channel directory) while the application-level retry
+                    # with jitter handles sustained contention. The previous
+                    # 1.0s timeout was too short when multiple threads hit
+                    # SQLite concurrently, causing cascading timeouts that
+                    # froze the gateway (#57921).
+                    timeout=30.0,
                     # auto-starts transactions on DML, which conflicts with
                     # our explicit BEGIN IMMEDIATE.  None = we manage
                     # transactions ourselves.
