@@ -108,6 +108,28 @@ def _session_entry_name(origin: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Build / refresh
 # ---------------------------------------------------------------------------
+import threading as _threading
+
+_cached_session_db = None
+_cached_session_db_lock = _threading.Lock()
+_channel_dir_building = False
+
+
+def _get_cached_session_db():
+    """Return a cached read-only SessionDB, creating one on first use."""
+    global _cached_session_db
+    if _cached_session_db is not None:
+        return _cached_session_db
+    with _cached_session_db_lock:
+        if _cached_session_db is not None:
+            return _cached_session_db
+        try:
+            from hermes_state import SessionDB
+            _cached_session_db = SessionDB(read_only=True)
+        except Exception:
+            _cached_session_db = None
+        return _cached_session_db
+
 
 async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     """
@@ -115,6 +137,18 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
 
     Returns the directory dict and writes it to DIRECTORY_PATH.
     """
+    global _channel_dir_building
+    if _channel_dir_building:
+        logger.debug("Channel directory: previous build still running — skipping")
+        return {}
+    _channel_dir_building = True
+    try:
+        return await _build_channel_directory_impl(adapters)
+    finally:
+        _channel_dir_building = False
+
+
+async def _build_channel_directory_impl(adapters: Dict[Any, Any]) -> Dict[str, Any]:
     from gateway.config import Platform
 
     platforms: Dict[str, List[Dict[str, str]]] = {}
@@ -292,17 +326,13 @@ def _build_from_sessions_db(platform_name: str) -> List[Dict[str, str]]:
     """Pull channels/contacts from state.db gateway session rows."""
     entries: List[Dict[str, str]] = []
     try:
-        from hermes_state import SessionDB
-        # read_only avoids _init_schema DDL write-lock contention with
-        # concurrent cron jobs, handoff watcher, and session store writes.
-        db = SessionDB(read_only=True)
-        try:
-            lister = getattr(db, "list_gateway_sessions", None)
-            if not callable(lister):
-                return []
-            rows = lister(platform=platform_name, active_only=False)
-        finally:
-            db.close()
+        db = _get_cached_session_db()
+        if db is None:
+            return []
+        lister = getattr(db, "list_gateway_sessions", None)
+        if not callable(lister):
+            return []
+        rows = lister(platform=platform_name, active_only=False)
 
         seen_ids = set()
         for row in rows:
