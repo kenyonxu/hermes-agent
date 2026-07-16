@@ -901,6 +901,15 @@ class SessionDB:
     # merge cost is amortised far below the checkpoint cadence.
     _OPTIMIZE_EVERY_N_WRITES = 1000
 
+    # Process-level set of db_path strings that have already been
+    # schema-initialised.  Once _init_schema runs for a given database
+    # file, subsequent SessionDB() connections to the same file skip the
+    # full DDL executescript + _reconcile_columns + UPDATE.  This avoids
+    # write-lock contention when multiple SessionDB instances are created
+    # concurrently (gateway + cron + channel directory).
+    _initialized_dbs: set = set()
+    _db_init_lock = __import__("threading").Lock()
+
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.read_only = read_only
@@ -1355,10 +1364,32 @@ class SessionDB:
 
         The schema_version table is retained for future data migrations
         (transforming existing rows) which cannot be handled declaratively.
-        """
-        cursor = self._conn.cursor()
 
-        cursor.executescript(SCHEMA_SQL)
+        **Performance**: ``_init_schema`` is cached per ``db_path`` at the
+        process level (``_initialized_dbs``).  After the first successful
+        run for a given database file, subsequent connections skip the
+        DDL executescript + column reconciliation entirely.  This avoids
+        SQLite reserved-lock contention when multiple ``SessionDB``
+        instances are created concurrently (gateway + cron + channel
+        directory).  The cache is bypassed in test environments
+        (``PYTEST_CURRENT_TEST`` in ``os.environ``) so test fixtures that
+        mock the connection still work.
+        """
+        db_key = str(self.db_path)
+        # Bypass cache in test environments so test fixtures work.
+        _in_test = "PYTEST_CURRENT_TEST" in __import__("os").environ
+        if not _in_test and db_key in SessionDB._initialized_dbs:
+            return
+
+        with SessionDB._db_init_lock:
+            # Double-check inside the lock — another thread may have
+            # completed _init_schema while we were waiting.
+            if not _in_test and db_key in SessionDB._initialized_dbs:
+                return
+
+            cursor = self._conn.cursor()
+
+            cursor.executescript(SCHEMA_SQL)
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
@@ -1591,6 +1622,10 @@ class SessionDB:
                     )
 
         self._conn.commit()
+
+        # Mark this database as schema-initialised so subsequent SessionDB
+        # connections to the same file skip the full DDL + reconciliation.
+        SessionDB._initialized_dbs.add(db_key)
 
     # =========================================================================
     # Session lifecycle
