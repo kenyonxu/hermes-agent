@@ -89,19 +89,111 @@ asyncio_2:      list_gateway_sessions (hermes_state.py:1848) ← channel directo
 | channel directory read_only + cache | `00273ae39` | Reduces `SessionDB()` creation in channel dir |
 | kanban disabled (config) | config.yaml | Eliminates kanban DB contention |
 
-## Root fix needed
+## TRUE root cause (found 2026-07-17)
 
-`_init_schema` should NOT run unconditionally on every `SessionDB()` construction.
-It should run once (first connect) and use a persistent marker (e.g. a row in
-`state_meta` or `PRAGMA user_version`) to skip DDL on subsequent connections
-to the same database file.
+The actual root cause was found after 5 freeze events and 4 rounds of
+mitigations that did not eliminate the problem.
 
-Alternatively, `_init_schema` could check whether the schema is already current
-via a lightweight `SELECT count(*) FROM sqlite_master` (no write lock) and skip
-the full `executescript` if all tables/indexes already exist.
+**Three `SessionDB` read methods accessed `self._conn` without acquiring
+`self._lock`:**
+
+- `list_pending_handoffs` — called every 2s by the handoff watcher
+- `get_handoff_state` — called during handoff processing
+- `get_compression_lock_holder` — called during compression checks
+
+`SessionDB` uses `check_same_thread=False` + `threading.Lock` to serialize
+all access to `self._conn`. The lock ensures only one thread uses the
+`sqlite3.Connection` at a time. Methods that skip the lock race with locked
+methods on the same connection object.
+
+Python's sqlite3 C extension has **no internal locking** for concurrent
+use of the same connection. When an unlocked method ran simultaneously
+with a locked method (e.g. `list_pending_handoffs` while
+`get_compression_failure_cooldown` held the lock), both threads entered
+`sqlite3_connection.execute()` in C at the same time, corrupting the
+connection's internal state and causing a permanent C-level block.
+
+This block is **not affected by `timeout=30.0`** — the timeout operates at
+SQLite's busy-handler level (waiting for another process's WAL lock), not
+at the sqlite3 Python module level (which is deadlocked internally).
+
+**Fix (commit a65c15222):** add `with self._lock:` to all three methods.
+
+**All previous mitigations were addressing symptoms, not the root cause:**
+
+| Fix | What it addressed | Why it wasn't enough |
+|-----|-------------------|----------------------|
+| DB prune + VACUUM | Reduced query time | Connection race still possible |
+| cron shared SessionDB | Fewer SessionDB instances | Race on gateway's shared instance |
+| timeout 1.0 → 30.0 | SQLite busy timeout | Doesn't help sqlite3 module deadlock |
+| channel directory cache | Fewer SessionDB instances | Race on gateway's shared instance |
+| `_init_schema` cache | Eliminated DDL write lock | Race was on SELECT queries, not DDL |
 
 ## Watchdog
 
 `scripts/gateway_freeze_watchdog.sh` runs via crontab every 2 minutes.
 On freeze detection (gateway.log stale > 120s), captures py-spy dump to
 `~/.hermes/profiles/zhihui/logs/freeze_dumps/`.
+
+---
+
+## Future directions (discussion, not yet planned)
+
+If the current mitigations prove insufficient, a more fundamental
+refactor of the SQLite data layer is the next step. Four directions
+were discussed:
+
+### 1. Single-writer thread + lock-free reads (recommended)
+
+A dedicated background writer thread processes all writes through a
+`queue.Queue`. Reads use read-only WAL connections (never block the
+writer). This eliminates write-lock contention entirely — there is
+only one writer. `_init_schema` runs once at writer startup. `timeout`
+becomes irrelevant.
+
+Pros: root-cause fix, standard SQLite-in-Python pattern (Django
+uses it), minimal API change (replace `_execute_write` with
+queue submit + Event wait).
+
+Cons: write latency increases by queue depth. Acceptable for Hermes's
+write profile (session metadata, routing index — not hot path).
+Priority queue or direct-write escape hatch needed for atomic CAS
+(`claim_handoff`).
+
+### 2. Connection pool per process (least architectural change)
+
+All `SessionDB()` construction goes through a shared pool (4 write +
+8 read connections). `_init_schema` runs once at pool init, not per
+connection.
+
+Pros: nearly transparent API (`SessionDB()` → `db_pool.acquire()`).
+Cons: write-lock contention still exists between pool's write
+connections, just without DDL overhead.
+
+### 3. Migrate away from SQLite (likely wrong)
+
+PostgreSQL or DuckDB. Probably incorrect — SQLite is the right
+choice for a personal, single-machine, embedded agent. The problem is
+misuse of SQLite's concurrency model, not SQLite itself. Migration
+cost (FTS5, WAL, PRAGMA tuning) is enormous.
+
+### 4. Tiered storage (most elegant, long-term)
+
+Split hot routing data (session_key → session_id, compression locks)
+from cold history (message transcripts). Hot layer lives in memory
+dict (already exists as `SessionStore._entries`), writes flush
+async to SQLite. Cold layer is append-only, written once per agent
+turn start/end.
+
+Pros: routing operations (`get_or_create_session`, `switch_session`)
+never touch SQLite at all — zero lock contention.
+Cons: significant refactor, async flush correctness, crash recovery
+for in-memory state.
+
+### Recommendation
+
+Direction 1 (single-writer thread) has the best cost/benefit ratio.
+Direction 4 is the ideal end state but requires more work. Both can
+coexist — start with 1, evolve toward 4 over time.
+
+**Decision: defer. Run current mitigations for observation first.**
