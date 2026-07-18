@@ -197,3 +197,53 @@ Direction 4 is the ideal end state but requires more work. Both can
 coexist — start with 1, evolve toward 4 over time.
 
 **Decision: defer. Run current mitigations for observation first.**
+
+---
+
+## Update 2026-07-18: freeze persists after lock fix — WAL growth hypothesis
+
+The `self._lock` fix (commit a65c15222) did NOT eliminate the freeze.
+py-spy dump from 2026-07-18 shows the SAME pattern — four threads stuck
+in SQLite queries:
+
+```
+asyncio_1:  get_compression_tip (hermes_state.py:2975)          ← SessionStore._db
+asyncio_2:  list_pending_handoffs (hermes_state.py:6444)        ← gateway AsyncSessionDB
+cron-parallel_1/2: get_compression_failure_cooldown (hermes_state.py:2168/2172) ← cron shared SessionDB
+asyncio_3:  list_gateway_sessions (hermes_state.py:1883)        ← channel directory cached SessionDB
+```
+
+All four methods now have `with self._lock:`, but they're on DIFFERENT
+`SessionDB` instances. Each instance has its own `threading.Lock` and its
+own `sqlite3.Connection` — so the Python-level lock doesn't help.
+
+The freeze is now at the SQLite level: multiple connections to the same
+WAL database, with a 101 MB WAL file that hasn't been checkpointed.
+
+### New hypothesis: WAL checkpoint starvation
+
+WAL mode allows concurrent readers + one writer. But when the WAL file
+grows large (101 MB observed), every read must scan WAL frames to find
+the latest version of each page — making reads O(WAL_size). With 4+
+concurrent connections all scanning a 101 MB WAL, the I/O contention
+slows everything to a crawl.
+
+WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE)`) would fix this by
+merging WAL frames into the main DB file. But:
+
+1. `TRUNCATE` checkpoint requires exclusive access — it fails if any
+   connection is mid-read (returns busy code 1).
+2. `PASSIVE` checkpoint runs every 50 writes per SessionDB instance, but
+   each instance tracks its own write count independently. If writes are
+   spread across 4 instances, none reaches the threshold quickly.
+3. Gateway housekeeping does NOT call `wal_checkpoint(TRUNCATE)`. Only
+   `SessionDB.close()` (on shutdown) and `maybe_auto_prune_and_vacuum`
+   (startup only) do TRUNCATE.
+
+### Proposed fix
+
+Add a periodic `wal_checkpoint(TRUNCATE)` to gateway housekeeping (every
+hour), and reduce `_CHECKPOINT_EVERY_N_WRITES` from 50 to 20 so PASSIVE
+checkpoint fires more often. Also consider `PRAGMA wal_autocheckpoint`
+setting (currently defaults to 1000 pages = ~4 MB, but may not trigger
+when writes are spread across connections).

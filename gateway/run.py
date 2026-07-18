@@ -20182,6 +20182,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
+    WAL_CHECKPOINT_EVERY = 30  # ticks — every 30 min, TRUNCATE checkpoint
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
@@ -20230,6 +20231,21 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                     )
             except Exception as e:
                 logger.debug("Paste sweep error: %s", e)
+
+        # WAL checkpoint — periodically merge WAL frames into the main DB
+        # file and truncate the WAL. Without this the WAL grows unbounded
+        # when writes are spread across multiple SessionDB connections (each
+        # has its own write counter so the per-instance PASSIVE checkpoint
+        # cadence is too slow). A large WAL makes every read scan all WAL
+        # frames, causing cascading I/O stalls that freeze the gateway.
+        if tick_count % WAL_CHECKPOINT_EVERY == 0:
+            try:
+                _db = getattr(self, "_session_db", None)
+                _raw = getattr(_db, "_db", _db) if _db else None
+                if _raw is not None:
+                    _raw._try_wal_checkpoint(truncate=True)
+            except Exception as e:
+                logger.debug("WAL checkpoint error: %s", e)
 
         # Curator — piggy-back on the housekeeping loop so long-running
         # gateways get weekly skill maintenance without needing restarts.
