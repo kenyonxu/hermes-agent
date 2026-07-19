@@ -20161,7 +20161,7 @@ def _run_planned_stop_watcher(
         stop_event.wait(poll_interval)
 
 
-def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
+def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, session_db=None):
     """Background thread for gateway-only periodic chores (NOT cron).
 
     Split out of the historical ``_start_cron_ticker`` so the cron *trigger*
@@ -20240,10 +20240,8 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         # frames, causing cascading I/O stalls that freeze the gateway.
         if tick_count % WAL_CHECKPOINT_EVERY == 0:
             try:
-                _db = getattr(self, "_session_db", None)
-                _raw = getattr(_db, "_db", _db) if _db else None
-                if _raw is not None:
-                    _raw._try_wal_checkpoint(truncate=True)
+                if session_db is not None:
+                    session_db._try_wal_checkpoint(truncate=True)
             except Exception as e:
                 logger.debug("WAL checkpoint error: %s", e)
 
@@ -20796,7 +20794,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     housekeeping_thread = threading.Thread(
         target=_start_gateway_housekeeping,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(), "session_db": getattr(getattr(runner, "_session_db", None), "_db", None)},
         daemon=True,
         name="gateway-housekeeping",
     )
