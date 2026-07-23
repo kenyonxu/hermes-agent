@@ -22768,7 +22768,8 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
-    WAL_CHECKPOINT_EVERY = 30  # ticks — every 30 min, TRUNCATE checkpoint
+    WAL_CHECKPOINT_EVERY = 30  # ticks — every 30 min, PASSIVE checkpoint
+    CRON_PRUNE_EVERY = 120   # ticks — every 2 hours, prune old cron sessions
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
     tick_count = 0
@@ -22834,6 +22835,18 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
                     session_db._try_wal_checkpoint()
             except Exception as e:
                 logger.debug("WAL checkpoint error: %s", e)
+
+        # Prune old cron sessions — cron jobs create a session every tick,
+        # filling state.db with small sessions that bloat FTS indexes and
+        # increase write-lock hold times. Delete cron sessions older than
+        # 3 days to keep the DB bounded.
+        if tick_count % CRON_PRUNE_EVERY == 0 and session_db is not None:
+            try:
+                _pruned = session_db.prune_sessions(older_than_days=3, source="cron")
+                if _pruned > 0:
+                    logger.info("Cron session prune: removed %d old session(s)", _pruned)
+            except Exception as e:
+                logger.debug("Cron session prune error: %s", e)
 
         # Curator — piggy-back on the housekeeping loop so long-running
         # gateways get weekly skill maintenance without needing restarts.
