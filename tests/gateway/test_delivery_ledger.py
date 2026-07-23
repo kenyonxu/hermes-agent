@@ -24,7 +24,9 @@ def _fresh_db(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setattr(dl, "_db_path", lambda: home / "state.db")
+    dl._close_conn()
     yield
+    dl._close_conn()
 
 
 def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
@@ -39,8 +41,8 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
 
 
 def _row(oid):
-    with dl._connect() as conn:
-        r = conn.execute(
+    conn = dl._get_conn()
+    r = conn.execute(
             """SELECT state, attempts, owner_pid, content
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
@@ -52,12 +54,13 @@ def _row(oid):
 
 def _orphan(oid):
     """Make the row look like it belongs to a dead process."""
-    with dl._connect() as conn:
-        conn.execute(
-            "UPDATE delivery_obligations SET owner_pid=999999999, "
-            "owner_started_at=1 WHERE obligation_id=?",
-            (oid,),
-        )
+    conn = dl._get_conn()
+    conn.execute(
+        "UPDATE delivery_obligations SET owner_pid=999999999, "
+        "owner_started_at=1 WHERE obligation_id=?",
+        (oid,),
+    )
+    conn.commit()
 
 
 class TestStateMachine:
@@ -136,8 +139,8 @@ class TestSweep:
     def test_attempts_cap_abandons(self):
         _record()
         _orphan("ob-1")
-        with dl._connect() as conn:
-            conn.execute(
+        conn = dl._get_conn()
+        conn.execute(
                 "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
                 (dl.MAX_ATTEMPTS, "ob-1"),
             )
@@ -156,8 +159,8 @@ class TestPrune:
     def test_old_delivered_rows_pruned(self):
         _record()
         dl.mark_delivered("ob-1")
-        with dl._connect() as conn:
-            conn.execute(
+        conn = dl._get_conn()
+        conn.execute(
                 "UPDATE delivery_obligations SET updated_at=? WHERE obligation_id=?",
                 (time.time() - dl._RETENTION_SECONDS - 60, "ob-1"),
             )
@@ -166,8 +169,8 @@ class TestPrune:
 
     def test_undelivered_rows_survive_retention(self):
         _record()
-        with dl._connect() as conn:
-            conn.execute(
+        conn = dl._get_conn()
+        conn.execute(
                 "UPDATE delivery_obligations SET updated_at=? WHERE obligation_id=?",
                 (time.time() - dl._RETENTION_SECONDS - 60, "ob-1"),
             )

@@ -53,6 +53,37 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 _DB_LOCK = threading.Lock()
+_CACHED_CONN = None
+_CACHED_CONN_LOCK = threading.Lock()
+
+
+def _get_conn() -> sqlite3.Connection:
+    """Return a cached SQLite connection (thread-safe singleton).
+
+    Reusing one connection avoids repeated sqlite3.connect + CREATE TABLE
+    DDL on every ledger call, which holds a write lock and blocks the event
+    loop when called from async code.
+    """
+    global _CACHED_CONN
+    if _CACHED_CONN is not None:
+        return _CACHED_CONN
+    with _CACHED_CONN_LOCK:
+        if _CACHED_CONN is not None:
+            return _CACHED_CONN
+        _CACHED_CONN = _connect()
+        return _CACHED_CONN
+
+
+def _close_conn() -> None:
+    """Close the cached connection (call at shutdown)."""
+    global _CACHED_CONN
+    with _CACHED_CONN_LOCK:
+        if _CACHED_CONN is not None:
+            try:
+                _CACHED_CONN.close()
+            except Exception:
+                pass
+            _CACHED_CONN = None
 
 # Redelivery policy knobs (module constants; deliberately not config — the
 # ledger itself is gated by ``gateway.delivery_ledger`` and these bounds
@@ -164,7 +195,8 @@ def record_obligation(
     """Record a final response as owed to the platform (state='pending')."""
     now = time.time()
     pid, started = _owner_stamp()
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK:
+        conn = _get_conn()
         conn.execute(
             """INSERT OR REPLACE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
@@ -191,7 +223,8 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
 
 
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK:
+        conn = _get_conn()
         conn.execute(
             """UPDATE delivery_obligations
                SET state=?, updated_at=?, last_error=?
@@ -224,7 +257,8 @@ def sweep_recoverable(
     now = now if now is not None else time.time()
     pid, started = _owner_stamp()
     claimed: List[Dict[str, Any]] = []
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK:
+        conn = _get_conn()
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
@@ -277,7 +311,8 @@ def _prune(now: Optional[float] = None) -> None:
     now = now if now is not None else time.time()
     cutoff = now - _RETENTION_SECONDS
     try:
-        with _connect() as conn:
+        with _DB_LOCK:
+            conn = _get_conn()
             conn.execute(
                 """DELETE FROM delivery_obligations
                    WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""",
@@ -299,6 +334,7 @@ def _prune(now: Optional[float] = None) -> None:
                          LIMIT ?)""",
                     (excess,),
                 )
+            conn.commit()
     except Exception:
         logger.debug("delivery ledger prune failed", exc_info=True)
 
@@ -321,7 +357,8 @@ def ledger_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
 
 def debug_rows(limit: int = 20) -> str:
     """Human-readable dump for ad-hoc inspection (sqlite3-free path)."""
-    with _DB_LOCK, _connect() as conn:
+    with _DB_LOCK:
+        conn = _get_conn()
         rows = conn.execute(
             """SELECT obligation_id, session_key, state, attempts,
                       created_at, updated_at, last_error
