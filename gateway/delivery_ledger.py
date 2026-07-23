@@ -58,32 +58,47 @@ _CACHED_CONN_LOCK = threading.Lock()
 
 
 def _get_conn() -> sqlite3.Connection:
-    """Return a cached SQLite connection (thread-safe singleton).
+    """Return a SQLite connection via the shared SessionDB singleton.
 
-    Reusing one connection avoids repeated sqlite3.connect + CREATE TABLE
-    DDL on every ledger call, which holds a write lock and blocks the event
-    loop when called from async code.
+    Uses the process-wide shared SessionDB's connection so delivery ledger
+    writes are serialized with all other state.db writers through one
+    threading.Lock — no WAL write-lock contention.
     """
-    global _CACHED_CONN
-    if _CACHED_CONN is not None:
-        return _CACHED_CONN
-    with _CACHED_CONN_LOCK:
-        if _CACHED_CONN is not None:
-            return _CACHED_CONN
-        _CACHED_CONN = _connect()
-        return _CACHED_CONN
+    from hermes_state import get_shared_session_db
+    db = get_shared_session_db()
+    if db is None:
+        raise RuntimeError("Shared SessionDB not available")
+    # Ensure the delivery_obligations table exists (idempotent).
+    # This runs on the shared connection, protected by its lock via
+    # _DB_LOCK below.
+    with _DB_LOCK:
+        try:
+            db._conn.execute(
+                """CREATE TABLE IF NOT EXISTS delivery_obligations (
+                    obligation_id TEXT PRIMARY KEY,
+                    session_key TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    thread_id TEXT,
+                    content TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    owner_pid INTEGER,
+                    owner_started_at INTEGER,
+                    last_error TEXT
+                )"""
+            )
+            db._conn.commit()
+        except Exception:
+            pass
+    return db._conn
 
 
 def _close_conn() -> None:
-    """Close the cached connection (call at shutdown)."""
-    global _CACHED_CONN
-    with _CACHED_CONN_LOCK:
-        if _CACHED_CONN is not None:
-            try:
-                _CACHED_CONN.close()
-            except Exception:
-                pass
-            _CACHED_CONN = None
+    """No-op — the shared SessionDB owns the connection."""
+    pass
 
 # Redelivery policy knobs (module constants; deliberately not config — the
 # ledger itself is gated by ``gateway.delivery_ledger`` and these bounds
