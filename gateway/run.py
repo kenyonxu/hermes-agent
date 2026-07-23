@@ -20241,7 +20241,11 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         if tick_count % WAL_CHECKPOINT_EVERY == 0:
             try:
                 if session_db is not None:
-                    session_db._try_wal_checkpoint(truncate=True)
+                    # PASSIVE mode: merges WAL frames without waiting for
+                    # readers/writers. Never blocks. TRUNCATE mode requires
+                    # exclusive access and blocks for seconds in multi-
+                    # connection scenarios, defeating the purpose.
+                    session_db._try_wal_checkpoint(truncate=False)
             except Exception as e:
                 logger.debug("WAL checkpoint error: %s", e)
 

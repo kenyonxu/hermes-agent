@@ -1221,9 +1221,10 @@ class SessionDB:
         """
         mode = "TRUNCATE" if truncate else "PASSIVE"
         try:
-            result = self._conn.execute(
-                f"PRAGMA wal_checkpoint({mode})"
-            ).fetchone()
+            with self._lock:
+                result = self._conn.execute(
+                    f"PRAGMA wal_checkpoint({mode})"
+                ).fetchone()
             if result and result[1] > 0:
                 logger.debug(
                     "WAL checkpoint(%s): %d/%d pages checkpointed",
