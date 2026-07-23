@@ -247,3 +247,91 @@ hour), and reduce `_CHECKPOINT_EVERY_N_WRITES` from 50 to 20 so PASSIVE
 checkpoint fires more often. Also consider `PRAGMA wal_autocheckpoint`
 setting (currently defaults to 1000 pages = ~4 MB, but may not trigger
 when writes are spread across connections).
+
+---
+
+## Update 2026-07-23: upstream sync + delivery_ledger + ongoing contention
+
+### After upstream merge (2046 commits)
+
+Merged upstream/main into fork. Key upstream changes that overlap with
+our fixes:
+
+- `c2a3b9ce5` PASSIVE WAL checkpoint (same as our fix)
+- `0695a6bce` FTS5 segment merge in write path (reduces WAL hold time)
+- `9acc4b47f` Schema v23 (external-content FTS + tool-row-free trigram)
+- New `delivery_ledger.py` module (upstream addition)
+
+### New freeze source: delivery_ledger
+
+`delivery_ledger._connect()` created a new `sqlite3.connect()` + ran
+`CREATE TABLE IF NOT EXISTS` DDL on every call. `mark_delivered` was
+called from the event loop main thread via `_process_message_background`,
+blocking the entire loop. Fixed by caching a singleton connection
+(commit `6c89cef9a`).
+
+### Ongoing contention: multi-connection write lock
+
+Even after all fixes, the gateway still freezes when multiple SessionDB
+instances concurrently write to state.db:
+
+```
+asyncio_1: _execute_write → replace_gateway_routing_entries (session store)
+ThreadPoolExecutor-2_0: _execute_write → update_system_prompt (agent)
+cron-parallel: _execute_write → create_session (cron job)
+```
+
+Each SessionDB instance has its own `sqlite3.Connection` to the same
+WAL database. `BEGIN IMMEDIATE` on one connection blocks all others.
+With `timeout=30s` + 15 retries, a single contested write can block
+for up to 450 seconds before giving up.
+
+### Root cause (confirmed, structural)
+
+**SQLite is a single-writer database. Hermes creates N independent
+SessionDB connections (gateway, cron, channel directory, delivery
+ledger, SessionStore) that each acquire WAL write locks. No amount of
+per-component caching or locking fixes this — the contention is at the
+SQLite level, between separate connections.**
+
+### Mitigations applied (all in this fork)
+
+| # | Commit | Fix | Effect |
+|---|--------|-----|--------|
+| 1 | `49a36a407` | cron shared SessionDB | 1 conn for all cron ticks |
+| 2 | `ea58523e4` | SQLite timeout 1.0→30.0 | Prevents cascading timeouts |
+| 3 | `00273ae39` | channel directory cache + overlap guard | 1 conn for channel dir |
+| 4 | `00aa84b63` | `_init_schema` per-db_path cache | DDL once per DB |
+| 5 | `a65c15222` | `self._lock` on 3 SessionDB methods | Connection-level race |
+| 6 | `381d24529`+`d4b405ab7`+`1c9ef1a7d` | WAL PASSIVE checkpoint in housekeeping | WAL bounded |
+| 7 | `6c89cef9a` | delivery_ledger connection cache | 1 conn for delivery |
+| 8 | `24bfe7840` | Auto-prune cron sessions every 2h | DB size bounded |
+| - | config | cron frequency 10m→30m, staggered | 67% fewer writes |
+| - | config | kanban disabled | Eliminates kanban.db contention |
+| - | config | lark-oapi 1.5.5→1.6.8 | Feishu reconnect loop fix |
+
+### Upstream status (2026-07-23)
+
+| Issue/PR | Status | Relevant? |
+|----------|--------|-----------|
+| #57921 | open | timeout=1.0 too short (our fix: 30.0) |
+| #39140 | open | schema init cache (our fix: _initialized_dbs) |
+| #60884 | closed | Salvage of DB offloads — explicitly excluded schema cache |
+| #44795 | open | _try_wal_checkpoint TRUNCATE corrupts WAL |
+| #64573 | open | SQLite lock → cron session source=unknown |
+| #24745 | open | TOCTOU race creating duplicate SessionDB connections |
+| #54889 | closed | WAL checkpoint blocked by unclosed connections (memory provider) |
+| `c2a3b9ce5` | merged | PASSIVE checkpoint (same as our fix) |
+| `0695a6bce` | merged | FTS5 segment merge in write path |
+
+**No upstream PR or issue proposes a systematic fix for the multi-connection
+write-lock contention. All fixes are per-component patches.**
+
+### Recommended root fix (deferred)
+
+**Single-writer thread pattern**: one background thread processes all
+state.db writes through a queue. Reads use read-only WAL connections
+(never block writes). Eliminates write-lock contention entirely.
+
+This is the same pattern Django uses for SQLite (`db.backends.sqlite3`).
+See "Future directions" section above for full discussion.
