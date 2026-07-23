@@ -335,3 +335,67 @@ state.db writes through a queue. Reads use read-only WAL connections
 
 This is the same pattern Django uses for SQLite (`db.backends.sqlite3`).
 See "Future directions" section above for full discussion.
+
+---
+
+## Update 2026-07-23 20:35: shared SessionDB singleton + delivery_ledger deadlock fix
+
+### Root fix deployed
+
+Two commits complete the shared writer SessionDB architecture:
+
+**`82c65674f`** — `get_shared_session_db()` process-level singleton.
+All write-access callers (gateway `AsyncSessionDB`, `SessionStore._db`,
+cron scheduler) now share one `SessionDB` instance: one
+`sqlite3.Connection`, one `threading.Lock`. `BEGIN IMMEDIATE` no longer
+contends with another connection.
+
+**`cd318a890`** — `delivery_ledger` routed through shared SessionDB's
+connection. Eliminated the last independent writer on `state.db`.
+
+**`1ad876703`** — Removed `_DB_LOCK` from `delivery_ledger._get_conn`
+to prevent AB-BA deadlock with `SessionDB._lock`. The `delivery_ledger`
+module's own `_DB_LOCK` would nest inside `SessionDB._lock` in some
+code paths, deadlocking both threads.
+
+### Architecture after all fixes
+
+```
+┌──────────────────────────────────────────────────────┐
+│ Process (one gateway instance)                       │
+│                                                      │
+│  get_shared_session_db() ──→ SessionDB (1 instance)  │
+│    ├── self._conn (1 sqlite3.Connection)             │
+│    ├── self._lock (1 threading.Lock)                 │
+│    └── self._initialized_dbs (schema cache)          │
+│                                                      │
+│  Callers sharing this instance:                      │
+│    ├── gateway/run.py (AsyncSessionDB wrapper)       │
+│    ├── gateway/session.py (SessionStore._db)         │
+│    ├── cron/scheduler.py (run_job)                   │
+│    └── gateway/delivery_ledger.py (_get_conn)        │
+│                                                      │
+│  Independent read-only connections (no contention):  │
+│    └── gateway/channel_directory.py (read_only=True) │
+└──────────────────────────────────────────────────────┘
+```
+
+### Complete fix chain (10 commits)
+
+| # | Commit | Fix | Root cause layer |
+|---|--------|-----|-----------------|
+| 1 | `49a36a407` | cron shared SessionDB | Per-tick connection creation |
+| 2 | `ea58523e4` | timeout 1.0→30.0 | SQLite busy timeout too short |
+| 3 | `00273ae39` | channel directory cache + overlap guard | Repeated connection creation |
+| 4 | `00aa84b63` | `_init_schema` per-db_path cache | DDL write-lock contention |
+| 5 | `a65c15222` | `self._lock` on 3 methods | sqlite3 connection race |
+| 6 | `381d24529`+`d4b405ab7`+`1c9ef1a7d` | WAL PASSIVE checkpoint | WAL growth starvation |
+| 7 | `6c89cef9a` | delivery_ledger connection cache | Event loop blocking on connect |
+| 8 | `24bfe7840` | Auto-prune cron sessions | DB growth management |
+| 9 | **`82c65674f`** | **shared SessionDB singleton** | **Multi-connection write lock contention** |
+| 10 | **`1ad876703`** | **delivery_ledger deadlock fix** | **AB-BA lock nesting** |
+
+### Status
+
+Gateway stable as of 2026-07-23 20:35. First successful message
+processing after the shared SessionDB + delivery_ledger fix.
