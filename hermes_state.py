@@ -153,6 +153,51 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
+_shared_writer: Optional["SessionDB"] = None
+_shared_writer_lock = threading.Lock()
+
+
+def get_shared_session_db(db_path: Path = None) -> "SessionDB":
+    """Return the process-wide shared SessionDB for write access.
+
+    All callers writing to the same db_path share one SessionDB instance,
+    one sqlite3.Connection, and one threading.Lock. This eliminates WAL
+    write-lock contention between concurrent callers (gateway, cron,
+    session store).
+
+    Read-only callers should continue to use ``SessionDB(read_only=True)``
+    directly — read-only WAL connections never acquire the write lock.
+
+    In test environments (``PYTEST_CURRENT_TEST`` in env), returns a fresh
+    ``SessionDB()`` each call so test isolation is preserved.
+    """
+    global _shared_writer
+    key = str(db_path or DEFAULT_DB_PATH)
+    if _shared_writer is not None and str(_shared_writer.db_path) == key:
+        return _shared_writer
+    with _shared_writer_lock:
+        if _shared_writer is not None and str(_shared_writer.db_path) == key:
+            return _shared_writer
+        try:
+            _shared_writer = SessionDB(db_path or DEFAULT_DB_PATH)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug("Shared SessionDB init failed: %s", e)
+            _shared_writer = None
+        return _shared_writer
+
+
+def close_shared_session_db() -> None:
+    """Close and reset the shared writer SessionDB singleton."""
+    global _shared_writer
+    with _shared_writer_lock:
+        if _shared_writer is not None:
+            try:
+                _shared_writer.close()
+            except Exception:
+                pass
+            _shared_writer = None
+
 SCHEMA_VERSION = 23
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the

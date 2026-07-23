@@ -339,8 +339,6 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
-_shared_session_db: Optional[object] = None
-_shared_session_db_lock = threading.Lock()
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
@@ -501,41 +499,6 @@ class _ReadWriteLock:
 _terminal_cwd_lock = _ReadWriteLock()
 
 
-def _get_shared_session_db():
-    """Return the scheduler-wide shared SessionDB (lazy singleton).
-
-    All cron job ticks reuse this instance instead of creating a new
-    SessionDB() per tick. SessionDB uses check_same_thread=False with an
-    internal threading.Lock, so concurrent cron-parallel threads calling
-    methods on the same instance is safe.
-    """
-    global _shared_session_db
-    if _shared_session_db is not None:
-        return _shared_session_db
-    with _shared_session_db_lock:
-        if _shared_session_db is not None:
-            return _shared_session_db
-        try:
-            from hermes_state import SessionDB
-            _shared_session_db = SessionDB()
-        except Exception as e:
-            logger.debug("Cron shared SessionDB init failed: %s", e)
-            _shared_session_db = None
-        return _shared_session_db
-
-
-def _close_shared_session_db() -> None:
-    """Close and reset the shared SessionDB singleton."""
-    global _shared_session_db
-    with _shared_session_db_lock:
-        if _shared_session_db is not None:
-            try:
-                _shared_session_db.close()
-            except Exception:
-                pass
-            _shared_session_db = None
-
-
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool."""
     global _parallel_pool, _parallel_pool_max_workers
@@ -577,7 +540,8 @@ def _shutdown_parallel_pool() -> None:
     if _sequential_pool is not None:
         _sequential_pool.shutdown(wait=True, cancel_futures=False)
         _sequential_pool = None
-    _close_shared_session_db()
+    from hermes_state import close_shared_session_db
+    close_shared_session_db()
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -2891,7 +2855,8 @@ def run_job(
     # _get_shared_session_db) so a wedged sqlite3.connect does not block
     # every cron tick — the worker thread is abandoned and subsequent
     # calls return None (matching the pre-singleton fallback behavior).
-    _session_db = _get_shared_session_db()
+    from hermes_state import get_shared_session_db
+    _session_db = get_shared_session_db()
     if _session_db is None:
         logger.debug("Job '%s': shared SQLite session store not available", job.get("id", "?"))
 

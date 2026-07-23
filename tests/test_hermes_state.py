@@ -7156,3 +7156,57 @@ class TestLoneSurrogatePersistence:
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
 
+
+
+class TestSharedWriterSessionDB:
+    """get_shared_session_db returns one process-wide instance for write access."""
+
+    def test_returns_same_instance(self, tmp_path, monkeypatch):
+        import hermes_state as hs
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "shared.db")
+        hs._shared_writer = None
+        try:
+            db1 = hs.get_shared_session_db()
+            db2 = hs.get_shared_session_db()
+            assert db1 is not None
+            assert db1 is db2
+        finally:
+            hs.close_shared_session_db()
+            hs._shared_writer = None
+
+    def test_close_resets_singleton(self, tmp_path, monkeypatch):
+        import hermes_state as hs
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "shared.db")
+        hs._shared_writer = None
+        try:
+            db1 = hs.get_shared_session_db()
+            hs.close_shared_session_db()
+            db2 = hs.get_shared_session_db()
+            assert db1 is not db2
+        finally:
+            hs.close_shared_session_db()
+            hs._shared_writer = None
+
+    def test_thread_safe_init(self, tmp_path, monkeypatch):
+        import hermes_state as hs
+        import threading
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "shared.db")
+        hs._shared_writer = None
+        results = []
+        barrier = threading.Barrier(5)
+
+        def get_db():
+            barrier.wait()
+            results.append(hs.get_shared_session_db())
+
+        threads = [threading.Thread(target=get_db) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        try:
+            assert all(r is results[0] for r in results)
+        finally:
+            hs.close_shared_session_db()
+            hs._shared_writer = None

@@ -3421,8 +3421,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Initialize session database for session_search tool support
         self._session_db = None
         try:
-            from hermes_state import AsyncSessionDB, SessionDB
-            self._session_db = AsyncSessionDB(SessionDB())
+            from hermes_state import AsyncSessionDB, get_shared_session_db
+            self._session_db = AsyncSessionDB(get_shared_session_db())
         except Exception as e:
             # WARNING (not DEBUG) so the failure appears in errors.log — matches
             # cli.py's handling of the same init path.  Users hitting NFS-mounted
