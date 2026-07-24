@@ -540,7 +540,8 @@ def _shutdown_parallel_pool() -> None:
     if _sequential_pool is not None:
         _sequential_pool.shutdown(wait=True, cancel_futures=False)
         _sequential_pool = None
-    from hermes_state import close_shared_session_db
+    from hermes_state import close_read_only_session_db, close_shared_session_db
+    close_read_only_session_db()
     close_shared_session_db()
 
 

@@ -5817,6 +5817,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True
 
+    async def _reader_call(self, name: str, *args):
+        """Call a read-only SessionDB method on the reader pool.
+
+        Falls back to the shared writer if the pool is unavailable or
+        errors. Only for pure-SELECT methods — never for writes or
+        read-your-own-write sequences.
+        """
+        reader = getattr(self, "_session_db_reader", None)
+        if reader is not None:
+            try:
+                return await getattr(reader, name)(*args)
+            except Exception:
+                pass  # fall through to writer
+        return await getattr(self._session_db, name)(*args)
+
     @staticmethod
     def _lookup_session_id_under_store_lock(session_store, session_key: str):
         """Sync helper run in the thread pool: read session_id under the store lock."""
@@ -10206,7 +10221,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             follows_compression = True
             try:
-                target_session_id = await session_db.get_compression_tip(
+                target_session_id = await self._reader_call("get_compression_tip", 
                     pinned_session_id
                 )
             except Exception:
@@ -10249,7 +10264,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     route_row = await session_db.get_session(session_entry.session_id)
                     route_tip = (
-                        await session_db.get_compression_tip(session_entry.session_id)
+                        await self._reader_call("get_compression_tip", session_entry.session_id)
                         if route_row is not None
                         and route_row.get("ended_at")
                         and route_row.get("end_reason") == "compression"
@@ -12428,7 +12443,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # a compression parent, so this is cheap and safe.
                 if bound_session_id and self._session_db is not None:
                     try:
-                        canonical_session_id = await self._session_db.get_compression_tip(
+                        canonical_session_id = await self._reader_call("get_compression_tip", 
                             bound_session_id,
                         )
                     except Exception:
@@ -15762,7 +15777,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_id:
             return f"Session not found: {raw_session_id.strip()}"
 
-        session = await self._session_db.get_session(session_id)
+        session = await self._reader_call("get_session", session_id)
         if not session:
             return f"Session not found: {raw_session_id.strip()}"
         if str(session.get("source") or "") != "telegram":
@@ -17344,7 +17359,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parent.get("end_reason") != "compression":
             return "terminal"
         try:
-            tip_session_id = await session_db.get_compression_tip(parent_session_id)
+            tip_session_id = await self._reader_call("get_compression_tip", parent_session_id)
             if not tip_session_id or tip_session_id == parent_session_id:
                 # Rotation caught mid-flight: parent is compression-ended but
                 # its continuation isn't visible yet. Retry, don't drop.
@@ -18372,7 +18387,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not _cache_lock or _cache is None:
             return
         try:
-            _sess_row = await self._session_db.get_session(session_id)
+            _sess_row = await self._reader_call("get_session", session_id)
             _live = _sess_row.get("message_count", 0) if _sess_row else None
         except Exception:
             return
