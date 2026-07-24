@@ -5302,9 +5302,10 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if getattr(result, "success", False):
-                                mark_delivered(_obligation_id)
+                                await asyncio.to_thread(mark_delivered, _obligation_id)
                             else:
-                                mark_failed(
+                                await asyncio.to_thread(
+                                    mark_failed,
                                     _obligation_id,
                                     str(getattr(result, "error", "") or ""),
                                 )
