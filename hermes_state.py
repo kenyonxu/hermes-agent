@@ -174,7 +174,10 @@ def get_shared_session_db(db_path: Path = None) -> "SessionDB":
     global _shared_writer
     key = str(db_path or DEFAULT_DB_PATH)
     if _shared_writer is not None and str(_shared_writer.db_path) == key:
-        return _shared_writer
+        if getattr(_shared_writer, "_conn", None) is not None:
+            return _shared_writer
+        # Connection was closed (e.g. test teardown). Discard and rebuild.
+        _shared_writer = None
     with _shared_writer_lock:
         if _shared_writer is not None and str(_shared_writer.db_path) == key:
             return _shared_writer

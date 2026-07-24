@@ -3432,6 +3432,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # hermes_state.get_last_init_error() for slash-command error strings.
             logger.warning("SQLite session store not available: %s", e)
 
+        self._session_db_reader = None
+        try:
+            from hermes_state import AsyncReadOnlySessionDB
+            self._session_db_reader = AsyncReadOnlySessionDB()
+        except Exception as e:
+            logger.debug("Read-only session DB pool not available: %s", e)
+
         # Opportunistic state.db maintenance: prune ended sessions older
         # than sessions.retention_days + optional VACUUM. Tracks last-run
         # in state_meta so it only actually executes once per
@@ -5782,6 +5789,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         if not session_id:
             return False
+        reader = getattr(self, "_session_db_reader", None)
+        if reader is not None:
+            try:
+                holder = await reader.get_compression_lock_holder(str(session_id))
+                return bool(holder)
+            except Exception:
+                pass  # fall through to writer
         session_db = getattr(self, "_session_db", None)
         if session_db is None:
             return False
@@ -8347,7 +8361,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if self._session_db is None:
                     await asyncio.sleep(interval)
                     continue
-                pending = await self._session_db.list_pending_handoffs()
+                pending = None
+                if self._session_db_reader is not None:
+                    try:
+                        pending = await self._session_db_reader.list_pending_handoffs()
+                    except Exception:
+                        pending = None
+                if pending is None:
+                    pending = await self._session_db.list_pending_handoffs()
                 for row in pending:
                     session_id = row.get("id")
                     if not session_id:
