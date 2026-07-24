@@ -6,6 +6,7 @@ import json
 from unittest import mock
 
 import pytest
+from unittest.mock import patch
 
 import hermes_state
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
@@ -7210,3 +7211,118 @@ class TestSharedWriterSessionDB:
         finally:
             hs.close_shared_session_db()
             hs._shared_writer = None
+
+
+class TestReadOnlyPool:
+    """get_read_only_session_db returns pooled read-only instances."""
+
+    def test_pool_returns_distinct_instances(self, tmp_path, monkeypatch):
+        import hermes_state as hs
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "pool.db")
+        hs._shared_writer = None
+        hs._shared_readers = []
+        hs._shared_readers_key = None
+        try:
+            hs.get_shared_session_db()  # writer first
+            dbs = [hs.get_read_only_session_db() for _ in range(hs.READER_POOL_SIZE)]
+            assert len(set(id(d) for d in dbs)) == hs.READER_POOL_SIZE
+        finally:
+            hs.close_read_only_session_db()
+            hs.close_shared_session_db()
+            hs._shared_writer = None
+            hs._shared_readers = []
+            hs._shared_readers_key = None
+
+    def test_round_robin_cycles(self, tmp_path, monkeypatch):
+        import hermes_state as hs
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "pool.db")
+        hs._shared_writer = None
+        hs._shared_readers = []
+        hs._shared_readers_key = None
+        hs._reader_rr = 0
+        try:
+            hs.get_shared_session_db()
+            d1 = hs.get_read_only_session_db()
+            d2 = hs.get_read_only_session_db()
+            assert d1 is not d2
+            for _ in range(hs.READER_POOL_SIZE - 2):
+                hs.get_read_only_session_db()
+            d_next = hs.get_read_only_session_db()
+            assert d_next is d1
+        finally:
+            hs.close_read_only_session_db()
+            hs.close_shared_session_db()
+            hs._shared_writer = None
+            hs._shared_readers = []
+            hs._shared_readers_key = None
+
+    def test_reader_rejects_writes(self, tmp_path, monkeypatch):
+        import sqlite3
+        import hermes_state as hs
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "pool.db")
+        hs._shared_writer = None
+        hs._shared_readers = []
+        hs._shared_readers_key = None
+        try:
+            writer = hs.get_shared_session_db()
+            writer.create_session("s1", source="cli")
+            reader = hs.get_read_only_session_db()
+            with pytest.raises(sqlite3.OperationalError):
+                reader.append_message("s1", role="user", content="hello")
+        finally:
+            hs.close_read_only_session_db()
+            hs.close_shared_session_db()
+            hs._shared_writer = None
+            hs._shared_readers = []
+            hs._shared_readers_key = None
+
+    def test_write_visible_to_reader(self, tmp_path, monkeypatch):
+        import hermes_state as hs
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "pool.db")
+        hs._shared_writer = None
+        hs._shared_readers = []
+        hs._shared_readers_key = None
+        try:
+            writer = hs.get_shared_session_db()
+            writer.create_session("s1", source="cli", model="m1")
+            reader = hs.get_read_only_session_db()
+            row = reader.get_session("s1")
+            assert row is not None
+            assert row["source"] == "cli"
+        finally:
+            hs.close_read_only_session_db()
+            hs.close_shared_session_db()
+            hs._shared_writer = None
+            hs._shared_readers = []
+            hs._shared_readers_key = None
+
+    def test_reader_requires_writer_first(self, tmp_path, monkeypatch):
+        """If the writer SessionDB fails to init, the reader must reject."""
+        import hermes_state as hs
+        monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "pool.db")
+        hs._shared_writer = None
+        hs._shared_readers = []
+        hs._shared_readers_key = None
+        with patch("hermes_state.SessionDB", side_effect=Exception("no db")):
+            with pytest.raises((RuntimeError, Exception)):
+                hs.get_read_only_session_db()
+
+    def test_pool_rebuilds_on_db_path_change(self, tmp_path, monkeypatch):
+        import hermes_state as hs
+        try:
+            monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "a.db")
+            hs.get_shared_session_db()
+            r1 = hs.get_read_only_session_db()
+            assert str(r1.db_path).endswith("a.db")
+            monkeypatch.setattr(hs, "DEFAULT_DB_PATH", tmp_path / "b.db")
+            hs.close_shared_session_db()
+            hs.get_shared_session_db()
+            r2 = hs.get_read_only_session_db()
+            assert str(r2.db_path).endswith("b.db")
+            assert r2 is not r1
+        finally:
+            hs.close_read_only_session_db()
+            hs.close_shared_session_db()
+            hs._shared_writer = None
+            hs._shared_readers = []
+            hs._shared_readers_key = None

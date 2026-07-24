@@ -198,6 +198,63 @@ def close_shared_session_db() -> None:
                 pass
             _shared_writer = None
 
+READER_POOL_SIZE = 3
+_shared_readers: list = []
+_shared_readers_key: Optional[str] = None
+_shared_reader_lock = threading.Lock()
+_reader_rr = 0
+
+
+def get_read_only_session_db() -> "SessionDB":
+    """Round-robin read-only SessionDB from a small pool.
+
+    Must only be called after the shared writer exists: a read-only
+    connection cannot perform crash recovery and relies on the -shm/-wal
+    files the writer creates.
+
+    The pool is keyed by the writer's db_path. If the active profile or
+    db_path changes, stale readers are closed and the pool is rebuilt
+    against the writer's current path.
+    """
+    global _reader_rr, _shared_readers, _shared_readers_key
+    with _shared_reader_lock:
+        writer = get_shared_session_db()
+        if writer is None:
+            raise RuntimeError(
+                "writer SessionDB must be initialized first"
+            )
+        key = str(writer.db_path)
+        if _shared_readers and _shared_readers_key != key:
+            for db in _shared_readers:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            _shared_readers = []
+        if not _shared_readers:
+            _shared_readers.extend(
+                SessionDB(writer.db_path, read_only=True)
+                for _ in range(READER_POOL_SIZE)
+            )
+            _shared_readers_key = key
+        db = _shared_readers[_reader_rr % len(_shared_readers)]
+        _reader_rr += 1
+        return db
+
+
+def close_read_only_session_db() -> None:
+    """Close all pool members (shutdown, test reset)."""
+    global _shared_readers, _shared_readers_key, _reader_rr
+    with _shared_reader_lock:
+        for db in _shared_readers:
+            try:
+                db.close()
+            except Exception:
+                pass
+        _shared_readers = []
+        _shared_readers_key = None
+        _reader_rr = 0
+
 SCHEMA_VERSION = 23
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -1537,6 +1594,7 @@ class SessionDB:
                 )
                 self._conn.row_factory = sqlite3.Row
                 apply_wal_with_fallback(self._conn, db_label="state.db")
+                self._conn.execute("PRAGMA wal_autocheckpoint=500")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
@@ -9737,5 +9795,27 @@ class AsyncSessionDB:
 
         async def _offloaded(*args, **kwargs):
             return await asyncio.to_thread(attr, *args, **kwargs)
+
+        return _offloaded
+
+
+class AsyncReadOnlySessionDB:
+    """Async wrapper that resolves a pool member per call.
+
+    Mirrors AsyncSessionDB but uses get_read_only_session_db() so reads
+    never contend with the writer's self._lock. Each call rotates to the
+    next pool connection for read concurrency.
+    """
+
+    def __getattr__(self, name: str):
+        def _resolve(*args, **kwargs):
+            db = get_read_only_session_db()
+            attr = getattr(db, name)
+            if not callable(attr):
+                return attr
+            return attr(*args, **kwargs)
+
+        async def _offloaded(*args, **kwargs):
+            return await asyncio.to_thread(_resolve, *args, **kwargs)
 
         return _offloaded
