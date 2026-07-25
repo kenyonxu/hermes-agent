@@ -111,6 +111,7 @@ import type { WiringActions, WiringApi } from './types'
 const AgentsView = lazy(async () => ({ default: (await import('../agents')).AgentsView }))
 const CommandCenterView = lazy(async () => ({ default: (await import('../command-center')).CommandCenterView }))
 const CronView = lazy(async () => ({ default: (await import('../cron')).CronView }))
+const WebhooksView = lazy(async () => ({ default: (await import('../webhooks')).WebhooksView }))
 const ProfilesView = lazy(async () => ({ default: (await import('../profiles')).ProfilesView }))
 const SettingsView = lazy(async () => ({ default: (await import('../settings')).SettingsView }))
 const StarmapView = lazy(async () => ({ default: (await import('../starmap')).StarmapView }))
@@ -197,7 +198,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     resetOverlayReturnRoute,
     settingsOpen,
     starmapOpen,
-    toggleCommandCenter
+    toggleCommandCenter,
+    webhooksOpen
   } = useOverlayRouting()
 
   const {
@@ -271,6 +273,23 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
     return () => window.removeEventListener('hermes:open-keybinds', onOpenKeybinds)
   }, [navigate])
+
+  // Dev-only: install the credit-notice demo trigger (Ctrl+Shift+C / ⌘K palette
+  // / window.__creditsDemo). Dynamic import inside the DEV guard so the module
+  // is dropped from production builds.
+  useEffect(() => {
+    if (!import.meta.env.DEV) {
+      return
+    }
+
+    let dispose: (() => void) | undefined
+
+    void import('./dev/credits-notice-demo').then(m => {
+      dispose = m.installCreditsNoticeDemo()
+    })
+
+    return () => dispose?.()
+  }, [])
 
   // Post-turn rehydrate from stored history (same behavior as DesktopController,
   // including finished-todos restoration).
@@ -986,6 +1005,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             onClose={closeOverlayToPreviousRoute}
             onOpenSession={sessionId => navigate(sessionRoute(sessionId))}
           />
+        </Suspense>
+      )}
+
+      {webhooksOpen && (
+        <Suspense fallback={null}>
+          <WebhooksView onClose={closeOverlayToPreviousRoute} />
         </Suspense>
       )}
 

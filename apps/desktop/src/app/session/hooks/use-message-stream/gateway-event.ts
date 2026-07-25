@@ -15,6 +15,7 @@ import { resolveGatewayEventSessionId } from '@/lib/gateway-events'
 import { triggerHaptic } from '@/lib/haptics'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
+import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgentNotice } from '@/store/agent-notices'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
 import { clearClarifyRequest, normalizeChoices, setClarifyRequest, warnDroppedChoices } from '@/store/clarify'
@@ -111,6 +112,8 @@ const COMPACTION_RESUME_EVENT_TYPES = new Set([
   'reasoning.available',
   'moa.reference',
   'moa.aggregating',
+  'moa.progress',
+  'moa.phase',
   'tool.start',
   'tool.progress',
   'tool.generating',
@@ -125,7 +128,12 @@ interface GatewayEventDeps {
   nativeSubagentSessionsRef: MutableRefObject<Set<string>>
   appendAssistantDelta: (sessionId: string, delta: string) => void
   appendReasoningDelta: (sessionId: string, delta: string, replace?: boolean) => void
-  completeAssistantMessage: (sessionId: string, text: string, responsePreviewed?: boolean) => void
+  completeAssistantMessage: (
+    sessionId: string,
+    text: string,
+    responsePreviewed?: boolean,
+    failure?: { error: string; partial: boolean }
+  ) => void
   failAssistantMessage: (sessionId: string, errorMessage: string) => void
   flushQueuedDeltas: (sessionId?: string) => void
   finalizeInterimAssistantMessage: (sessionId: string, text: string) => void
@@ -523,7 +531,26 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const cnt = typeof payload?.count === 'number' ? payload.count : undefined
           const header = idx && cnt ? `◇ Reference ${idx}/${cnt} — ${label}` : `◇ Reference — ${label}`
           const body = coerceThinkingText(payload?.text)
-          appendReasoningDelta(sessionId, `${header}\n${body}\n\n`, true)
+          const text = `${header}\n${body}\n\n`
+
+          if (idx === undefined || idx <= 1) {
+            // First reference: clear any stale reasoning left over from
+            // before this turn's references start, same as before.
+            appendReasoningDelta(sessionId, text, true)
+          } else {
+            // Later references must accumulate, not replace — otherwise
+            // each new reference wipes out the ones already shown (#64658).
+            // Queue-then-flush (rather than the streamed/batched queue path)
+            // applies it immediately, since each reference arrives as one
+            // complete block rather than incremental tokens. reasoning.delta
+            // cannot be mid-flight here: MoAChatCompletions.reference_callback
+            // (agent/moa_loop.py) fires "moa.reference" once per reference's
+            // already-complete text, with no concurrent token stream for the
+            // reference-gathering phase, so there is no in-flight delta to
+            // collide with in the shared queue bucket.
+            appendReasoningDelta(sessionId, text, false)
+            flushQueuedDeltas(sessionId)
+          }
         }
 
         if (isActiveEvent) {
@@ -532,6 +559,38 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       } else if (event.type === 'moa.aggregating') {
         // Status transition only; the aggregator's reply arrives via the normal
         // message stream. No reasoning/transcript mutation here.
+        if (isActiveEvent) {
+          setPetActivity({ reasoning: true })
+        }
+      } else if (event.type === 'moa.progress') {
+        // Live reference fan-out progress ("refs k/n") — surfaced in the same
+        // reasoning disclosure the references land in. These lines arrive
+        // BEFORE any moa.reference event (references are only emitted once the
+        // whole fan-out completes), and the first moa.reference replaces the
+        // block, so the progress trail is self-cleaning.
+        if (sessionId && typeof payload?.refs_done === 'number' && typeof payload?.refs_total === 'number') {
+          const label = coerceGatewayText(payload?.label)
+
+          const line = label
+            ? `◇ MoA refs ${payload.refs_done}/${payload.refs_total} — ${label}\n`
+            : `◇ MoA refs ${payload.refs_done}/${payload.refs_total}\n`
+
+          appendReasoningDelta(sessionId, line, payload.refs_done <= 1)
+          flushQueuedDeltas(sessionId)
+        }
+
+        if (isActiveEvent) {
+          setPetActivity({ reasoning: true })
+        }
+      } else if (event.type === 'moa.phase') {
+        // Phase transition — currently only phase="aggregator" (fan-out done,
+        // aggregator acting). Append a one-line marker; the first
+        // moa.reference that follows replaces the whole block.
+        if (sessionId && payload?.phase === 'aggregator') {
+          appendReasoningDelta(sessionId, '◇ MoA aggregating…\n', false)
+          flushQueuedDeltas(sessionId)
+        }
+
         if (isActiveEvent) {
           setPetActivity({ reasoning: true })
         }
@@ -558,7 +617,19 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         playCompletionSound(sessionId)
 
         const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
-        completeAssistantMessage(sessionId, finalText, payload?.response_previewed)
+
+        // Terminal error frames (status "error") carry the failure in
+        // structured fields: `error` is the message, and `partial` marks
+        // `text` as streamed output to keep rather than the error string.
+        const failure =
+          payload?.status === 'error'
+            ? {
+                error: coerceGatewayText(payload.error).trim() || finalText || 'Hermes reported an error',
+                partial: Boolean(payload.partial)
+              }
+            : undefined
+
+        completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure)
 
         // Structured billing wall forwarded by the gateway (out of credits /
         // payment required) — cache it + raise a billing-specific toast.
@@ -865,6 +936,37 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             ]
           }))
         }
+      } else if (event.type === 'notification.show') {
+        // Driver-agnostic agent notice (credits usage/grant/depleted/restored
+        // from `agent/credits_tracker.py`). The Ink TUI renders these in its
+        // status bar; the desktop renders them as toasts. The notice key doubles
+        // as the toast id, so the escalating 50→75→90 credits line replaces in
+        // place instead of stacking. Account-wide signal — shown regardless of
+        // which session is focused.
+        const notice = event.payload as AgentNoticePayload | undefined
+
+        showAgentNotice(notice)
+
+        // The urgent pair (access paused / restored) also breaks through as a
+        // native OS notification when Hermes is backgrounded; dispatch is gated
+        // by the user's notification prefs + backgrounded check.
+        const native = nativeNoticeInput(notice, translateNow('notifications.native.creditsTitle'))
+
+        if (native) {
+          dispatchNativeNotification(native)
+        }
+
+        // A credits crossing moves the account balance. Settings → Billing polls
+        // `billing.state` every 30s; nudge it so the page reflects the crossing
+        // immediately instead of up to 30s late.
+        if (notice?.key?.startsWith('credits.')) {
+          void queryClient.invalidateQueries({ queryKey: ['billing', 'state'] })
+        }
+      } else if (event.type === 'notification.clear') {
+        // Key-matched dismissal (e.g. credits restored clears the depleted
+        // notice). notify() keys the toast by the notice key, so this maps
+        // straight to dismissNotification(key).
+        clearAgentNotice((event.payload as AgentNoticePayload | undefined)?.key)
       } else if (event.type === 'error') {
         const errorMessage = payload?.message || 'Hermes reported an error'
         const looksLikeProviderSetup = isProviderSetupErrorMessage(errorMessage)
