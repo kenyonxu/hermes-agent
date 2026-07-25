@@ -22804,7 +22804,6 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     PASTE_SWEEP_EVERY = 60   # ticks — once per hour
     CURATOR_EVERY = 60       # ticks — poll hourly (inner gate handles the real cadence)
-    WAL_CHECKPOINT_EVERY = 30  # ticks — every 30 min, PASSIVE checkpoint
     CRON_PRUNE_EVERY = 120   # ticks — every 2 hours, prune old cron sessions
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)
