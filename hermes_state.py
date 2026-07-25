@@ -623,9 +623,20 @@ def apply_wal_with_fallback(
     *,
     db_label: str = "state.db",
 ) -> str:
-    """Set ``journal_mode=WAL`` on ``conn``, falling back to DELETE on failure.
+    """Set journal_mode=DELETE on conn.
 
-    Returns the journal mode actually set (``"wal"`` or ``"delete"``).
+    Previously used WAL mode, but WAL's checkpoint starvation under
+    long-lived reader connections (reader pool pins WAL frames,
+    preventing auto-checkpoint from merging them) caused unbounded WAL
+    growth and cascading I/O freezes. DELETE mode has no WAL file,
+    no checkpoint, and no reader-pinning — at the cost of read/write
+    not being fully concurrent (writes briefly block reads, but each
+    write is microseconds so the impact is negligible).
+
+    If the database is already in WAL mode on disk, it is migrated to
+    DELETE on the first connection.
+
+    Returns the journal mode actually set (always ``"delete"``).
 
     On WAL-incompatible filesystems (NFS, SMB, some FUSE), SQLite raises
     ``OperationalError("locking protocol")`` when setting WAL.  We fall
@@ -650,38 +661,16 @@ def apply_wal_with_fallback(
     _on_disk_journal_mode.  That holds for both the NFS path and the
     WAL-reset vulnerability path.
     """
-    # Vulnerable SQLite: do not enable WAL on new/non-WAL files.
-    if is_sqlite_wal_reset_vulnerable():
-        return _apply_delete_for_wal_reset_bug(conn, db_label=db_label)
-
-    # Read-only probe — no flock, no checkpoint, no WAL/SHM unlink.
-    # Skipping the set-pragma prevents WAL-init from unlinking files other connections hold open.
+    # Force DELETE journal mode. If the DB is currently in WAL mode
+    # (migrated from a previous version), switch it to DELETE. This
+    # requires exclusive access for a brief moment — the first connection
+    # after restart handles it.
     try:
-        current_mode = conn.execute("PRAGMA journal_mode").fetchone()
-        if current_mode and current_mode[0] == "wal":
-            _apply_macos_checkpoint_barrier(conn)
-            _enforce_macos_synchronous_full(conn)
-            return "wal"
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        _apply_macos_checkpoint_barrier(conn)
-        _enforce_macos_synchronous_full(conn)
-        return "wal"
-    except sqlite3.OperationalError as exc:
-        msg = str(exc).lower()
-        if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
-            # Unrelated OperationalError — don't silently swallow.
-            raise
-        # Don't downgrade if another process already set WAL on disk.
-        existing = _on_disk_journal_mode(conn)
-        if existing == "wal":
-            raise
-        _log_wal_fallback_once(db_label, exc)
         conn.execute("PRAGMA journal_mode=DELETE")
-        return "delete"
+    except sqlite3.OperationalError:
+        pass  # DELETE is the SQLite default; usually a no-op
+    _enforce_macos_synchronous_full(conn)
+    return "delete"
 
 
 def _apply_delete_for_wal_reset_bug(
@@ -1967,7 +1956,6 @@ class SessionDB:
                 )
                 self._conn.row_factory = sqlite3.Row
                 apply_wal_with_fallback(self._conn, db_label="state.db")
-                self._conn.execute("PRAGMA wal_autocheckpoint=500")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
