@@ -399,3 +399,50 @@ code paths, deadlocking both threads.
 
 Gateway stable as of 2026-07-23 20:35. First successful message
 processing after the shared SessionDB + delivery_ledger fix.
+
+---
+
+## Update 2026-07-26: DELETE journal mode (the definitive fix)
+
+### Root fix: eliminate WAL entirely
+
+All previous fixes (shared SessionDB, reader pool, checkpoint tuning,
+WAL autocheckpoint) were treating symptoms of WAL mode. The root cause
+was WAL itself: long-lived reader connections pin WAL frames, preventing
+checkpoint, causing unbounded WAL growth, making every query scan all
+WAL frames, causing cascading I/O freezes.
+
+**Commit `47f4e7bac`**: `apply_wal_with_fallback()` now forces
+`journal_mode=DELETE` instead of WAL. No WAL file = no checkpoint
+starvation = no reader pin = no WAL growth = no freeze.
+
+### Why DELETE mode is safe for Hermes
+
+- **Reads briefly blocked during writes** — but writes are microseconds,
+  and the shared writer's `self._lock` serializes them anyway
+- **No concurrent read during write** — acceptable: handoff watcher,
+  compression checks, and session lookups wait <1ms per write
+- **Simpler crash recovery** — rollback journal or nothing, no WAL replay
+- **No `-wal` / `-shm` file management** — one less moving part
+
+### Complete fix chain (12 commits, 14 days)
+
+| # | Commit | Fix | Layer |
+|---|--------|-----|-------|
+| 1 | `49a36a407` | cron shared SessionDB | Per-tick connection creation |
+| 2 | `ea58523e4` | timeout 1.0→30.0 | SQLite busy timeout |
+| 3 | `00273ae39` | channel directory cache | Repeated connection creation |
+| 4 | `00aa84b63` | `_init_schema` cache | DDL write-lock contention |
+| 5 | `a65c15222` | `self._lock` on 3 methods | sqlite3 connection race |
+| 6 | `381d24529`+`d4b405ab7` | WAL checkpoint housekeeping | WAL growth |
+| 7 | `6c89cef9a` | delivery_ledger cache | Event loop blocking |
+| 8 | `24bfe7840` | Auto-prune cron sessions | DB growth |
+| 9 | `82c65674f` | Shared SessionDB singleton | Multi-connection write contention |
+| 10 | `1ad876703` | delivery_ledger deadlock fix | AB-BA lock nesting |
+| 11 | `648d236c1`+`9645809ad` | Reader pool + read-write split | Read serialization |
+| 12 | **`47f4e7bac`** | **DELETE journal mode** | **WAL eliminated entirely** |
+
+### Status: gateway stable
+
+DELETE mode deployed 2026-07-26 07:05. No WAL file. All platforms
+connected. Monitoring for stability.
