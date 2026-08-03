@@ -247,6 +247,37 @@ _shared_writer: Optional["SessionDB"] = None
 _shared_writer_lock = threading.Lock()
 
 
+def _resolve_session_db_timeout() -> float:
+    """Resolve the bounded-init timeout for the shared SessionDB singleton.
+
+    Resolution order mirrors the cron job path: ``HERMES_CRON_SESSION_DB_TIMEOUT``
+    env override → ``cron.session_db_timeout_seconds`` in config.yaml → 10s
+    default. 0 = unlimited (skip the bound).
+    """
+    raw = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            logging.getLogger(__name__).warning(
+                "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using config/default",
+                raw,
+            )
+    try:
+        from hermes_cli.config import load_config
+
+        _cfg = load_config() or {}
+        _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
+        _configured = _cron_cfg.get("session_db_timeout_seconds")
+        if _configured is not None:
+            return float(_configured)
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "Failed to load cron.session_db_timeout_seconds from config: %s", exc
+        )
+    return 10.0
+
+
 def get_shared_session_db(db_path: Path = None) -> "SessionDB":
     """Return the process-wide shared SessionDB for write access.
 
@@ -255,11 +286,13 @@ def get_shared_session_db(db_path: Path = None) -> "SessionDB":
     write-lock contention between concurrent callers (gateway, cron,
     session store).
 
+    The initial construction is bounded by ``_resolve_session_db_timeout()``
+    so a wedged ``sqlite3.connect`` (e.g. a stale flock left by a crashed
+    sibling process) cannot block every caller forever: the worker thread is
+    abandoned and subsequent calls return None until the next attempt.
+
     Read-only callers should continue to use ``SessionDB(read_only=True)``
     directly — read-only WAL connections never acquire the write lock.
-
-    In test environments (``PYTEST_CURRENT_TEST`` in env), returns a fresh
-    ``SessionDB()`` each call so test isolation is preserved.
     """
     global _shared_writer
     key = str(db_path or DEFAULT_DB_PATH)
@@ -271,10 +304,23 @@ def get_shared_session_db(db_path: Path = None) -> "SessionDB":
     with _shared_writer_lock:
         if _shared_writer is not None and str(_shared_writer.db_path) == key:
             return _shared_writer
+        timeout = _resolve_session_db_timeout()
         try:
-            _shared_writer = SessionDB(db_path or DEFAULT_DB_PATH)
+            if timeout > 0:
+                import concurrent.futures
+
+                _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                try:
+                    _shared_writer = _pool.submit(
+                        SessionDB, db_path or DEFAULT_DB_PATH
+                    ).result(timeout=timeout)
+                finally:
+                    # Don't wait for a wedged connect() to unwind — abandon
+                    # the worker thread rather than blocking shutdown on it.
+                    _pool.shutdown(wait=False)
+            else:
+                _shared_writer = SessionDB(db_path or DEFAULT_DB_PATH)
         except Exception as e:
-            import logging
             logging.getLogger(__name__).debug("Shared SessionDB init failed: %s", e)
             _shared_writer = None
         return _shared_writer
@@ -348,7 +394,6 @@ def close_read_only_session_db() -> None:
         _shared_readers_key = None
         _reader_rr = 0
 
-SCHEMA_VERSION = 23
 # Import-time snapshot used by _default_db_path() to detect a deliberately
 # re-pointed DEFAULT_DB_PATH (tests monkeypatch the constant directly).
 _IMPORT_DEFAULT_DB_PATH = DEFAULT_DB_PATH
@@ -2958,205 +3003,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             (self._FTS_TRASH_PREFIX.replace("_", "\\_") + "%",),
         ).fetchone())
 
-    def _demote_legacy_fts_to_trash(self) -> int:
-        """Demote the legacy inline FTS vtables and stage their shadow tables
-        for chunked teardown. Returns MAX(messages.id) as the rebuild high
-        water. O(1) schema surgery — the heavy delete is deferred to the
-        chunked teardown, exactly as the validated auto path did."""
-        def _do(conn):
-            self._drop_fts_triggers(conn)
-            conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
-            had = bool(conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-                "AND name IN ('messages_fts', 'messages_fts_trigram') "
-                "AND sql LIKE 'CREATE VIRTUAL TABLE%' LIMIT 1"
-            ).fetchone())
-            if had:
-                conn.execute("PRAGMA writable_schema=ON")
-                conn.execute(
-                    "DELETE FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('messages_fts', 'messages_fts_trigram') "
-                    "AND sql LIKE 'CREATE VIRTUAL TABLE%'"
-                )
-                conn.execute("PRAGMA writable_schema=RESET")
-                shadows = [
-                    r[0] for r in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table' "
-                        "AND (name LIKE 'messages_fts_%' ESCAPE '\\' "
-                        "OR name LIKE 'messages_fts_trigram_%' ESCAPE '\\')"
-                    ).fetchall()
-                ]
-                for sh in shadows:
-                    conn.execute(f"ALTER TABLE {sh} RENAME TO fts_v22_trash_{sh}")
-            # Create the new v23 empty schema + set the backfill markers.
-            self._ensure_fts_schema(conn, "messages_fts", FTS_SQL)
-            self._ensure_fts_schema(conn, "messages_fts_trigram", FTS_TRIGRAM_SQL)
-            hw = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
-            for k, v in (
-                ("fts_rebuild_high_water", str(hw)),
-                ("fts_rebuild_progress", "0"),
-            ):
-                conn.execute(
-                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (k, v),
-                )
-            conn.execute("DELETE FROM state_meta WHERE key = 'fts_optimize_available'")
-            return hw
-        return int(self._execute_write(_do))
-
-    def optimize_fts_storage(
-        self,
-        *,
-        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
-        vacuum: bool = True,
-    ) -> Dict[str, Any]:
-        """Migrate a legacy v22 inline-FTS DB to the v23 external-content
-        schema, foreground and to completion. Safe to re-run: if a previous
-        attempt was interrupted it resumes from the progress marker.
-
-        ``progress_cb`` receives {"phase", "percent", "indexed", "total"}
-        dicts for a CLI progress bar. Returns a summary dict.
-
-        The trigram tokenizer being unavailable is not fatal — the base index
-        is still rebuilt (CJK falls back to LIKE), mirroring normal startup.
-        """
-        if not self._fts_enabled:
-            return {"ok": False, "reason": "fts5_unavailable"}
-        if self.read_only:
-            return {"ok": False, "reason": "read_only"}
-
-        # Only demote if we're actually still on the legacy shape. If a prior
-        # run already demoted (markers/trash present), skip straight to
-        # finishing the backfill + teardown — this is what makes re-running
-        # after an interruption safe.
-        with self._lock:
-            legacy = self._db_has_legacy_inline_fts(self._conn)
-        pending = self.get_meta("fts_rebuild_high_water") is not None
-        if legacy and not pending:
-            self._demote_legacy_fts_to_trash()
-
-        # A stale CJK index (triggers dropped by a tokenizer-less process)
-        # can only be recovered from scratch — reset it now so the cjk
-        # backfill phase below rebuilds it. No-op without the tokenizer.
-        self._fts_cjk_reset_if_stale()
-        # An optimized v23 DB gaining the cjk index for the first time (no
-        # legacy work left, tokenizer newly installed): ensure the table +
-        # markers exist so the backfill phase has work to claim.
-        if self._fts_cjk_loaded:
-            with self._lock:
-                self._ensure_fts_cjk_schema(self._conn)
-                self._conn.commit()
-
-        def _emit(phase: str) -> None:
-            if progress_cb is None:
-                return
-            st = self.fts_rebuild_status()
-            if st is None:
-                st = self.fts_cjk_rebuild_status()
-            progress_cb({
-                "phase": phase,
-                "percent": st["percent"] if st else 100,
-                "indexed": st["indexed"] if st else 0,
-                "total": st["total"] if st else 0,
-            })
-
-        def _pause(chunk_seconds: float) -> None:
-            """Inter-chunk throttle (see the chunk-engine note above).
-
-            The chunk methods themselves never sleep, so this loop is the
-            single place the duty cycle is enforced: without it, back-to-back
-            BEGIN IMMEDIATE chunks starve any live gateway/CLI process
-            sharing the DB out of its lock retries (the measured ~85%
-            write-lock ownership that froze concurrent sessions).
-            """
-            time.sleep(max(
-                self._FTS_REBUILD_MIN_PAUSE,
-                chunk_seconds * self._FTS_REBUILD_DUTY_FACTOR,
-            ))
-
-        # Phase 1: backfill (foreground, throttled between chunks so a live
-        # gateway sharing the DB stays responsive).
-        _emit("backfill")
-        while True:
-            _t0 = time.monotonic()
-            if not self.fts_rebuild_step():
-                break
-            _emit("backfill")
-            _pause(time.monotonic() - _t0)
-        _emit("backfill")
-
-        # Phase 1b: backfill the CJK-bigram index (its own marker pair; a
-        # no-op when the tokenizer isn't loadable or nothing is pending).
-        while True:
-            _t0 = time.monotonic()
-            if not self.fts_cjk_rebuild_step():
-                break
-            _emit("backfill")
-            _pause(time.monotonic() - _t0)
-
-        # Phase 2: tear down the demoted legacy shadow tables in chunks.
-        _emit("teardown")
-        while True:
-            _t0 = time.monotonic()
-            if not self._fts_teardown_trash_step():
-                break
-            _emit("teardown")
-            _pause(time.monotonic() - _t0)
-
-        # Phase 3: reclaim freed pages to the OS.
-        vacuum_ok = None
-        if vacuum:
-            _emit("vacuum")
-            try:
-                with self._lock:
-                    self._conn.execute("VACUUM")
-                vacuum_ok = True
-            except sqlite3.OperationalError as exc:
-                # Most common cause: not enough free disk for VACUUM's temp
-                # copy. The optimization still succeeded; space just isn't
-                # reclaimed until a later VACUUM. Non-fatal.
-                logger.warning("VACUUM after FTS optimize failed: %s", exc)
-                vacuum_ok = False
-            # Best-effort: fold the WAL back into the main file so the on-disk
-            # size settles now rather than at close(). NOTE this is REFUSED
-            # (SQLITE_BUSY) while any other connection holds a WAL read-mark —
-            # e.g. a live gateway sharing the DB — so it is not sufficient on
-            # its own. Callers must therefore NOT size the result by stat()ing
-            # the file; use :meth:`logical_size_bytes`, which is truthful
-            # immediately regardless of readers.
-            try:
-                with self._lock:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception as exc:
-                logger.debug(
-                    "WAL checkpoint (TRUNCATE) after optimize VACUUM failed: %s",
-                    exc,
-                )
-
-        # Phase 4: stamp the FTS storage layout as current, clear the "available"
-        # flag, and advance schema_version if it was somehow still behind (the
-        # main version normally advances on open now, but bump defensively so a
-        # DB opened only by pre-decoupling code still settles). The FTS-layout
-        # marker is the source of truth for "is this DB optimized".
-        def _settle(conn):
-            conn.execute(
-                "INSERT INTO state_meta (key, value) VALUES ('fts_storage_version', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (str(FTS_STORAGE_VERSION),),
-            )
-            conn.execute("DELETE FROM state_meta WHERE key = 'fts_optimize_available'")
-            conn.execute(
-                "UPDATE schema_version SET version = ? WHERE version < ?",
-                (SCHEMA_VERSION, SCHEMA_VERSION),
-            )
-        self._execute_write(_settle)
-        _emit("done")
-        logger.info(
-            "FTS storage optimization complete (layout v%d).", FTS_STORAGE_VERSION
-        )
-        return {"ok": True, "vacuumed": vacuum_ok}
-
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
         """Extract expected columns per table from SCHEMA_SQL.
@@ -3289,6 +3135,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # migration was skipped (e.g. due to version renumbering), the
         # column gets created here.
         self._reconcile_columns(cursor)
+
+        # Rebuild gateway_routing if it still carries the pre-scope PRIMARY
+        # KEY (session_key alone). ADD COLUMN cannot fix a PK, so this is
+        # the one table-shape repair reconciliation can't express.
+        self._heal_gateway_routing_pk(cursor)
+
+        # Rebuild session_model_usage if its PRIMARY KEY lacks the ``task``
+        # column (5-column PK on installs already at v22+ when the column
+        # landed — the version-gated rebuild is unreachable there, #73823).
+        # Same PK-rebuild constraint as gateway_routing above.
+        self._heal_session_model_usage_pk(cursor)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
@@ -3569,6 +3426,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if fts5_available and self._db_has_legacy_inline_fts(cursor):
                     self.set_meta("fts_optimize_available", "1", cursor=cursor)
 
+            if current_version < 25:
+                # v25: de-duplicate per-session system prompt snapshots into
+                # a shared content-addressed table. Keep the old column as a
+                # read fallback for partially migrated or externally written
+                # rows, but clear migrated rows so future writes do not keep
+                # one large prompt copy per session.
+                self._dedupe_legacy_system_prompts(cursor)
+
             # The FTS storage layout is versioned independently of the main
             # schema (see the v23 note above). Stamp the current layout so the
             # main version can always advance: a fresh/optimized DB is at
@@ -3587,6 +3452,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "WHERE key = 'fts_rebuild_high_water' LIMIT 1"
                 ).fetchone() is None
                 and not self._has_fts_trash(cursor)
+                and not self._fts_external_index_empty_with_messages(cursor)
             ):
                 self.set_meta(
                     "fts_storage_version", str(FTS_STORAGE_VERSION), cursor=cursor
@@ -3697,6 +3563,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # CJK-bigram index (cjk_unicode61). Strictly additive to
                     # the surfaces above and gated on the loadable tokenizer:
                     self._ensure_fts_cjk_schema(cursor)
+
+            # Replace any pre-existing broad AFTER UPDATE triggers with
+            # AFTER UPDATE OF variants. IF NOT EXISTS cannot rewrite them.
+            if getattr(self, "_fts_enabled", False):
+                self._migrate_broad_fts_update_triggers(cursor)
 
         self._conn.commit()
 
