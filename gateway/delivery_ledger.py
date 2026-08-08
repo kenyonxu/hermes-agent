@@ -76,14 +76,21 @@ def _db_path():
 
 
 def _connect() -> sqlite3.Connection:
+    """Return the shared SessionDB writer connection, or fall back to direct."""
+    from hermes_state import get_shared_session_db
+    db = get_shared_session_db()
+    if db is not None:
+        try:
+            _initialize_schema(db._conn)
+        except Exception:
+            pass
+        return db._conn
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    conn = sqlite3.connect(str(path), timeout=10)
     try:
         _initialize_schema(conn)
     except Exception:
-        # A PRAGMA/DDL failure after a successful connect() must not leak the
-        # just-opened connection back to the caller.
         conn.close()
         raise
     return conn
