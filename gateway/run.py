@@ -11595,18 +11595,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # to /new (does not kill the turn; see agent.session_stall_timeout).
         self._spawn_supervised(self._session_stall_watcher, "session_stall_watcher")
 
-        # Start background kanban notifier — each gateway delivers events for
-        # subscriptions owned by the profiles whose adapters it hosts, even
-        # when another gateway owns the single dispatcher.
-        self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
+       # Start background kanban notifier — each gateway delivers events for
+       # subscriptions owned by the profiles whose adapters it hosts, even
+       # when another gateway owns the single dispatcher.
+        # Disabled: kanban not in use, and the notifier creates independent
+        # kanban.db connections that contend with state.db under DELETE mode.
+        # self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
-        # Start background kanban dispatcher — spawns workers for ready
-        # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
-        # When false, users run `hermes kanban daemon` externally or
-        # simply don't use kanban; this loop becomes a no-op.
-        self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
+       # Start background kanban dispatcher — spawns workers for ready
+       # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
+       # When false, users run `hermes kanban daemon` externally or
+       # simply don't use kanban; this loop becomes a no-op.
+        # Disabled alongside notifier.
+        # self._spawn_supervised(self._kanban_dispatcher_watcher, "kanban_dispatcher_watcher")
 
-        # Start background reconnection watcher for platforms that failed at startup
+       # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
                 "Starting reconnection watcher for %d failed platform(s): %s",
