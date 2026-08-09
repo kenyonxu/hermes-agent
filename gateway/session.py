@@ -1849,9 +1849,9 @@ class SessionStore:
         another team's session. The caller performs one explicit exact lookup
         of the old unscoped key instead.
         """
-        if not self._db:
+        if not self._get_db():
             return None
-        finder = getattr(self._db, "find_latest_gateway_session_for_peer", None)
+        finder = getattr(self._get_db(), "find_latest_gateway_session_for_peer", None)
         if not callable(finder):
             return None
         try:
@@ -1936,6 +1936,23 @@ class SessionStore:
                 display_name=entry.display_name,
             )
         return entry
+
+    def _get_db(self):
+        """Return the shared SessionDB, rebuilding if the connection was closed."""
+        db = getattr(self, "_db", None)
+        if db is not None and getattr(db, "_conn", None) is not None:
+            return db
+        # Connection was closed — re-fetch from the shared singleton.
+        try:
+            from hermes_state import get_shared_session_db
+            db = get_shared_session_db()
+            if db is None:
+                from hermes_state import SessionDB
+                db = SessionDB()
+            self._db = db
+        except Exception:
+            pass
+        return db
 
     def _query_recoverable_session(
         self, *, session_key, source, now, lookup_session_key=None
@@ -2183,7 +2200,7 @@ class SessionStore:
         if not db or not session_id:
             return False
         try:
-            row = db.get_session(session_id)
+            row = self._get_db().get_session(session_id)
         except Exception:
             return False
         return bool(row is not None and row.get("end_reason") is not None)
@@ -2246,7 +2263,7 @@ class SessionStore:
         if not session_id or self._db is None:
             return session_id
         try:
-            return self._db.get_compression_tip(session_id) or session_id
+            return self._get_db().get_compression_tip(session_id) or session_id
         except Exception:
             logger.debug(
                 "Compression-tip lookup failed for session %s",
