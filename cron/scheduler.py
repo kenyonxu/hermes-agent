@@ -2234,7 +2234,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
+                # Include target context (platform/chat) so a bare error string
+                # like "Discord send failed: TimeoutError: " is attributable.
+                # Not inside an except block — the error comes from the send
+                # result dict, so there is no traceback to attach.
+                msg = f"delivery error: {result['error']} (target {platform_name}:{chat_id})"
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
@@ -2817,9 +2821,25 @@ def _build_job_prompt(
         )
         parts.insert(0, notice)
 
+    stable_prefix = None
     if prompt:
-        parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
-    return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+        from agent.skill_commands import append_user_instruction
+
+        parts.append("")
+        # The skill blocks (and any skipped-skill notice) above are stable per
+        # job config; the appended instruction carries the volatile per-run
+        # data (cron hint + prompt + script output + run context). Declare
+        # that boundary for the Anthropic cache planner (#81867).
+        stable_prefix = append_user_instruction(parts, prompt)
+    assembled = _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+    if stable_prefix and len(assembled) > len(stable_prefix) and assembled.startswith(stable_prefix):
+        # Guarded because the injection scanner may sanitize (mutate) the
+        # assembled bytes; a mismatch simply falls back to whole-message
+        # caching.
+        from agent.prompt_cache_boundary import register_stable_prefix
+
+        register_stable_prefix(stable_prefix)
+    return assembled
 
 
 def _scan_assembled_cron_prompt(
@@ -3195,6 +3215,22 @@ def run_job(
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
     if job.get("no_agent"):
+        # Load .env before the script runs so auto-delivery can resolve home
+        # channels. A standalone cron tick process typically starts WITHOUT
+        # TELEGRAM_HOME_CHANNEL/DISCORD_HOME_CHANNEL in its environment, and
+        # the agent path's per-run dotenv reload below never executes for
+        # no_agent jobs — every deliver=telegram/all script job failed with
+        # "no delivery target resolved". load_hermes_dotenv does not override
+        # already-set vars, so the gateway's in-process tick is unaffected.
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+
+            load_hermes_dotenv(hermes_home=_get_hermes_home())
+        except Exception:
+            logger.debug(
+                "Job '%s': no_agent .env reload failed", job_id, exc_info=True
+            )
+
         script_path = job.get("script")
         if not script_path:
             err = "no_agent=True but no script is set for this job"
@@ -4198,11 +4234,33 @@ def run_job(
         # and soft-failure marking below apply — restoring pre-#34452 silence
         # for scheduled jobs without disabling the explainer everywhere.
         if final_response.strip() and turn_exit_reason:
+            # The formatter's wording varies by persistence cause (locked /
+            # disk / unknown), so render every variant — matching only the
+            # one-argument render would let cause-refined explainer text slip
+            # through and be delivered as a cron warning.
+            _explainer_variants = []
             try:
-                _explainer_text = AIAgent._format_turn_completion_explanation(turn_exit_reason)
+                from hermes_state import PERSISTENCE_ERROR_CAUSES as _causes
             except Exception:
-                _explainer_text = ""
-            if _explainer_text and final_response.strip() == _explainer_text.strip():
+                _causes = ("locked", "disk", "unknown")
+            for _cause in (None, *_causes):
+                try:
+                    _variant = AIAgent._format_turn_completion_explanation(
+                        turn_exit_reason, _cause
+                    )
+                except TypeError:
+                    # Older single-argument formatter (or a test double).
+                    try:
+                        _variant = AIAgent._format_turn_completion_explanation(
+                            turn_exit_reason
+                        )
+                    except Exception:
+                        _variant = ""
+                except Exception:
+                    _variant = ""
+                if _variant:
+                    _explainer_variants.append(_variant.strip())
+            if final_response.strip() in _explainer_variants:
                 logger.info(
                     "Job '%s': abnormal empty turn (%s) — suppressing explainer for cron delivery",
                     job_id,
