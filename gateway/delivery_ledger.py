@@ -75,25 +75,38 @@ def _db_path():
     return get_hermes_home() / "state.db"
 
 
+_CACHED_CONN = None
+_CACHED_CONN_LOCK = threading.Lock()
+
+
 def _connect() -> sqlite3.Connection:
-    """Return the shared SessionDB writer connection, or fall back to direct."""
-    from hermes_state import get_shared_session_db
-    db = get_shared_session_db()
-    if db is not None:
+    """Return a cached DEDICATED connection (NOT the shared writer).
+
+    delivery_ledger's _transaction() always closes the connection on exit,
+    so it MUST NOT use the shared SessionDB writer's connection — closing
+    it would break every other DB user. Instead, cache a dedicated
+    connection that persists across calls.
+    """
+    global _CACHED_CONN
+    if _CACHED_CONN is not None:
         try:
-            _initialize_schema(db._conn)
+            _CACHED_CONN.execute("SELECT 1")
+            return _CACHED_CONN
         except Exception:
-            pass
-        return db._conn
-    path = _db_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=10)
-    try:
-        _initialize_schema(conn)
-    except Exception:
-        conn.close()
-        raise
-    return conn
+            _CACHED_CONN = None
+    with _CACHED_CONN_LOCK:
+        if _CACHED_CONN is not None:
+            return _CACHED_CONN
+        path = _db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(path), timeout=30)
+        try:
+            _initialize_schema(conn)
+        except Exception:
+            conn.close()
+            raise
+        _CACHED_CONN = conn
+        return conn
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -135,8 +148,11 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     try:
         with conn:
             yield conn
-    finally:
-        conn.close()
+    except Exception:
+        # On error, invalidate the cached connection
+        global _CACHED_CONN
+        _CACHED_CONN = None
+        raise
 
 
 def _owner_stamp() -> tuple[int, Optional[int]]:
