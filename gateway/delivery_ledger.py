@@ -78,7 +78,7 @@ def _db_path():
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    conn = sqlite3.connect(str(path), timeout=30)
     try:
         _initialize_schema(conn)
     except Exception:
