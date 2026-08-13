@@ -171,7 +171,7 @@ Since `resolve_journal_mode()` returns `wal` by default, every
 
 ## Verification
 
-```
+```text
 $ grep -rn "apply_wal_with_fallback" --include="*.py" .   # tests excluded
 hermes_state.py:1005: def apply_wal_with_fallback(...)
 hermes_state.py:2844:     apply_wal_with_fallback(self._conn, ...)  # SessionDB.__init__
@@ -223,6 +223,34 @@ Test evidence after fixes #10–#11 (conda python, pytest 9.0.3):
    to ≥3.50.7/≥3.51.3 would have re-armed the freeze. And when verifying
    "no more callers", actually re-run the grep against the tree — the
    earlier Verification output was written from intent, not from reality.
+
+## Addendum: same-day incident — superlocalmemory WAL-close deadlock (12:42–13:03)
+
+After fixes #10–#11 shipped and the gateway was restarted (12:32), a
+*different* SQLite failure class surfaced at 12:42: a user reply was
+generated but never delivered (`delivery_obligations` row stuck in
+`attempting`, `attempts=0`, 20+ minutes), while `/health` stayed 200.
+
+py-spy native dumps showed the gateway's delivery worker and
+cron-scheduler blocked in `findReusableFd → pthread_mutex_lock` — a
+**process-global VFS mutex** inside libsqlite3 3.51.1 — because an
+embedded superlocalmemory thread (`mslm-sync`) was blocked in
+`sqlite3WalClose → unixLock` (WAL close checkpoint waiting on the 15-day
+unified_daemon's reader pin) **while holding that mutex**. Every
+subsequent `sqlite3.connect()` in the process convoyed behind it.
+
+This is unrelated to the journal-mode-switch contention above (our fixes
+held — no `apply_wal_with_fallback` callers remain), but same theme:
+WAL + long-lived connections + a SQLite-internal global lock.
+
+- **Recovery**: gateway restart adopted the orphaned obligation and
+  delivered at 13:03:15. Gateway down 12:42–13:03 for that chat.
+- **Mitigation applied**: all 7 `~/.superlocalmemory/*.db` switched to
+  DELETE, daemon + gateway restarted. Note: slm re-forced WAL on startup
+  (hard-coded `PRAGMA journal_mode=WAL` in ~10 places), so the DELETE
+  switch does not persist; the structural fix is tracked in the slm repo.
+- **Full postmortem** (stacks, mechanism, remediation options):
+  `superlocalmemory/docs/postmortem-2026-08-13-sqlite-global-mutex-deadlock.md`
 
 ## Recommended follow-up — DONE (2026-08-13)
 
