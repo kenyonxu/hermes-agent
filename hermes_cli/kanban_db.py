@@ -2184,15 +2184,18 @@ def connect(
     # unbounded flock with no timeout, no LOCK_NB, no recovery (#36644). On the
     # steady-state path there is nothing for the cross-process lock to protect
     # (no schema/migration writes run), so skip it entirely and just open the
-    # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
+    # connection with the durability pragmas under the cheap in-process
+    # _INIT_LOCK.
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                # Journal mode is left untouched: switching it takes an
+                # exclusive lock and freezes every other connection in DELETE
+                # mode (post-merge fix log 2026-08-13). The on-disk mode
+                # persists, so pre-existing WAL kanban.db files keep WAL.
                 conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
@@ -2222,15 +2225,11 @@ def connect(
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
-                # WAL activation can take an exclusive lock while SQLite creates the
-                # sidecar files for a fresh database. Keep it in the same process-local
-                # critical section as schema initialization so concurrent gateway
-                # startup threads do not race before _INITIALIZED_PATHS is populated.
-                # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-                # falls back to DELETE with one ERROR log so kanban stays usable there.
-                # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                # No journal-mode switch here: in DELETE mode every WAL
+                # attempt takes an exclusive lock and freezes all other
+                # connections (post-merge fix log 2026-08-13). Fresh databases
+                # default to DELETE; pre-existing WAL files keep their mode.
+                # The pragmas below are applied either way.
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
                 conn.execute("PRAGMA synchronous=FULL")

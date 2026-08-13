@@ -135,9 +135,9 @@ def _connect() -> sqlite3.Connection:
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state import apply_wal_with_fallback
-
-    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
+    # Journal mode is SessionDB's call, not ours: in DELETE mode every
+    # PRAGMA journal_mode=WAL attempt needs an exclusive lock and freezes
+    # all other state.db connections (post-merge fix log 2026-08-13).
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,

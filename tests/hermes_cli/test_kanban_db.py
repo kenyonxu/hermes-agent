@@ -873,25 +873,20 @@ class TestSharedBoardPaths:
 
 
 # ---------------------------------------------------------------------------
-# NFS / network-filesystem fallback (see hermes_state.apply_wal_with_fallback)
+# Journal-mode non-interference contract (post-merge fix log 2026-08-13):
+# connect() must never attempt a journal-mode switch. On a DELETE-mode
+# database every WAL attempt takes an exclusive lock and freezes all other
+# connections; downgrading a live WAL database would destroy committed-
+# but-uncheckpointed transactions. The on-disk mode simply persists.
 # ---------------------------------------------------------------------------
 
-def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch, caplog):
-    """kanban_db.connect() must handle ``locking protocol`` on NFS/SMB.
+def test_connect_never_attempts_wal_switch(tmp_path, monkeypatch):
+    """kanban_db.connect() must not issue any journal_mode=WAL attempt.
 
-    Without this fallback, the gateway's kanban dispatcher crashes every
-    60s and the kanban migration (``consecutive_failures`` ADD COLUMN) is
-    retried forever — which is what the real-world user report shows
-    (see hermes-agent issue #22032).
-
-    NOTE: We do NOT use the ``kanban_home`` fixture here because that
-    fixture pre-initializes the DB via ``kb.init_db()`` — putting the
-    file in WAL on disk. The Bug D safety guard now refuses to downgrade
-    to DELETE when the on-disk header is already WAL, so testing the
-    NFS-fallback path requires a truly-fresh DB file (NFS scenario in
-    production: first connection of the first process ever to touch the
-    file, where downgrading is safe because nobody else has WAL state
-    yet).
+    A connection double that raises ``locking protocol`` on journal_mode=WAL
+    proves the attempt never happens: before the 2026-08-13 fix the attempt
+    went out on every connect; now connect() leaves the journal mode
+    untouched and the fresh DB stays in the default DELETE mode.
     """
     import sqlite3 as _sqlite3
     from unittest.mock import patch as _patch
@@ -901,18 +896,8 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-    # These tests exercise the WAL-attempt path; assume a fixed SQLite so the
-    # WAL-reset vulnerability gate doesn't short-circuit before the pragma.
-    import hermes_state as _hermes_state
-    monkeypatch.setattr(
-        _hermes_state, "is_sqlite_wal_reset_vulnerable",
-        lambda version_info=None: False,
-    )
-    _hermes_state._wal_fallback_warned_paths.clear()
-
     # Clear module cache so a fresh connect() is attempted
     kb._INITIALIZED_PATHS.clear()
-    hermes_state._wal_fallback_warned_paths.clear()
 
     real_connect = _sqlite3.connect
 
@@ -932,30 +917,26 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
         )
 
     with _patch("hermes_cli.kanban_db.sqlite3.connect", side_effect=wal_blocking_connect):
-        with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
+        conn = kb.connect()
 
-    # One fallback error, naming kanban.db
-    errors = [
-        r
-        for r in caplog.records
-        if r.levelname == "ERROR" and "kanban.db" in r.getMessage()
-    ]
-    assert len(errors) >= 1, (
-        f"Expected a kanban.db ERROR, got: {[r.getMessage() for r in caplog.records]}"
-    )
+    # Fresh DB keeps the default (DELETE) mode — no switch was attempted.
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
 
-    # DB still usable end-to-end — create + list a task
-    t = kb.create_task(conn, title="post-fallback task")
+    # DB usable end-to-end — create + list a task
+    t = kb.create_task(conn, title="no-wal-switch task")
     tasks = kb.list_tasks(conn)
     assert any(row.id == t for row in tasks)
     conn.close()
 
 
-def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplog):
-    """kanban_db.connect() must stay usable when WAL silently no-ops to DELETE."""
+def test_connect_preserves_preexisting_wal_mode(tmp_path, monkeypatch):
+    """A kanban.db already in WAL mode on disk keeps WAL after connect().
+
+    connect() touches the journal mode in neither direction — no WAL attempt
+    (which would block all connections on a DELETE-mode DB) and no downgrade
+    (which would destroy committed-but-uncheckpointed WAL transactions).
+    """
     import sqlite3 as _sqlite3
-    from unittest.mock import patch as _patch
 
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -963,48 +944,21 @@ def test_connect_works_when_wal_is_silently_refused(tmp_path, monkeypatch, caplo
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
     kb._INITIALIZED_PATHS.clear()
-    hermes_state._wal_fallback_warned_paths.clear()
-    # Assume a fixed SQLite so the WAL-reset gate doesn't short-circuit.
-    monkeypatch.setattr(
-        hermes_state, "is_sqlite_wal_reset_vulnerable",
-        lambda version_info=None: False,
-    )
 
-    real_connect = _sqlite3.connect
+    # First connect creates the DB (default DELETE mode); then flip it to
+    # WAL externally to model a pre-fix install.
+    kb.connect().close()
+    seed = _sqlite3.connect(str(kb.kanban_db_path()))
+    assert seed.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+    seed.close()
 
-    class _WalSilentNoOpConnection(_sqlite3.Connection):
-        def execute(self, sql, *args, **kwargs):  # type: ignore[override]
-            if "journal_mode=wal" in sql.lower().replace(" ", ""):
-                return super().execute("PRAGMA journal_mode=delete", *args, **kwargs)
-            return super().execute(sql, *args, **kwargs)
-
-    def wal_silent_noop_connect(*args, **kwargs):
-        kwargs.pop("factory", None)
-        return real_connect(
-            *args, factory=_WalSilentNoOpConnection, **kwargs
-        )
-
-    with _patch(
-        "hermes_cli.kanban_db.sqlite3.connect",
-        side_effect=wal_silent_noop_connect,
-    ):
-        with caplog.at_level("ERROR", logger="hermes_state"):
-            conn = kb.connect()
-
-    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
-    t = kb.create_task(conn, title="post-silent-fallback task")
+    kb._INITIALIZED_PATHS.clear()
+    conn = kb.connect()
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    t = kb.create_task(conn, title="kept-wal task")
     tasks = kb.list_tasks(conn)
     assert any(row.id == t for row in tasks)
     conn.close()
-
-    errors = [
-        r
-        for r in caplog.records
-        if r.levelname == "ERROR" and "kanban.db" in r.getMessage()
-    ]
-    assert len(errors) >= 1, (
-        f"Expected a kanban.db ERROR, got: {[r.getMessage() for r in caplog.records]}"
-    )
 
 
 def test_unlink_tasks_triggers_recompute_ready(kanban_home):
