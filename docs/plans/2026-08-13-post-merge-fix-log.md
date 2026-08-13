@@ -83,6 +83,49 @@ Removed `apply_wal_with_fallback` from both `delivery_ledger.py` and
 Removed `apply_wal_with_fallback` from `agent/verification_evidence.py`.
 This was the last remaining external caller.
 
+### 10. Remaining apply_wal_with_fallback callers removed (2026-08-13)
+
+The Verification section below previously claimed only `hermes_state.py`
+called `apply_wal_with_fallback`. A same-day audit found that claim was
+wrong — seven external call sites remained, and all were removed:
+
+| Module | DB file | Notes |
+| -------- | --------- | ------- |
+| `tools/async_delegation.py` | state.db | **Hot path** — every `_connect()` hit the shared DB |
+| `cron/notepad.py` | cron/notepad.db | every notepad transaction |
+| `hermes_cli/kanban_db.py` (2 sites) | kanban.db | every connect, incl. steady-state fast path |
+| `gateway/platforms/api_server.py` | response_store.db | store init |
+| `plugins/memory/holographic/store.py` | memory_store.db | `_init_db()` |
+| `plugins/platforms/discord/recovery.py` | discord_recovery.db | recovery ledger init |
+| `hermes_cli/projects_db.py` | projects.db | every connect |
+
+The two kanban NFS-fallback tests were rewritten to the new contract —
+`connect()` must never attempt a journal-mode switch:
+`test_connect_never_attempts_wal_switch`,
+`test_connect_preserves_preexisting_wal_mode`.
+
+### 11. `database.journal_mode: delete` set in config (2026-08-13)
+
+Applied to both `~/.hermes/config.yaml` and the active profile
+`~/.hermes/profiles/zhihui/config.yaml`. The gateway resolves config
+against the **profile** home, so editing only the default-home file would
+have left it unprotected. Verified: `resolve_journal_mode()` returns
+`delete` under both homes.
+
+### Why the surviving callers had not been freezing the gateway
+
+Incidental protection, not design: this host's SQLite is **3.45.1**, which
+falls inside the WAL-reset-bug range (3.7.0–3.51.2; backports only in
+3.50.7/3.44.6), so `is_sqlite_wal_reset_vulnerable()` gated every
+`apply_wal_with_fallback` call into `_apply_delete_for_wal_reset_bug()` —
+a **no-wait** path that never blocks. Upgrading SQLite to ≥3.50.7 /
+≥3.51.3 (cf. `17bf3c8283`, "repair vulnerable managed SQLite builds")
+would have disarmed that gate and re-armed the freeze:
+`resolve_journal_mode()` defaults to `wal`
+(`hermes_cli/config_defaults.py:17`), so every surviving caller would have
+attempted a blocking `PRAGMA journal_mode=WAL` per connect. Fixes #10
+and #11 defuse that time bomb.
+
 ## Root cause analysis
 
 ### The journal mode contention pattern
@@ -128,14 +171,31 @@ Since `resolve_journal_mode()` returns `wal` by default, every
 ## Verification
 
 ```
-$ grep -rn "apply_wal_with_fallback" --include="*.py" .
+$ grep -rn "apply_wal_with_fallback" --include="*.py" .   # tests excluded
 hermes_state.py:1005: def apply_wal_with_fallback(...)
 hermes_state.py:2844:     apply_wal_with_fallback(self._conn, ...)  # SessionDB.__init__
 ```
 
-Only `hermes_state.py` (internal to SessionDB, which uses the resolver
-that respects our DELETE config) calls it now. No external module
-attempts journal mode switching.
+Only `hermes_state.py` (internal to SessionDB, which honors the configured
+`database.journal_mode: delete`) calls it now. **No external module
+attempts journal-mode switching.**
+
+> **Correction (2026-08-13):** an earlier revision of this section showed
+> the same grep output *before* fix #10, but that output did not match the
+> tree — seven external callers still existed at the time
+> (async_delegation, notepad, kanban_db ×2, api_server, holographic,
+> discord recovery, projects_db). The grep above was re-run after fix #10
+> and reflects the true current state.
+
+Test evidence after fixes #10–#11 (conda python, pytest 9.0.3):
+
+- `tests/hermes_cli/test_kanban_db.py` (full file) +
+  `test_journal_mode_config.py` + `test_doctor_journal_modes.py`:
+  73 passed, 1 skipped
+- `test_projects_db.py` + `test_delegate_cascade_49148.py`: 10 passed
+- `tests/cron/test_notepad.py` + delegation/cronjob suites: 43 passed
+- `test_api_server_*.py` (3 files): 46 passed
+- discord gateway suites: 10 passed
 
 ## Lessons
 
@@ -146,16 +206,30 @@ attempts journal mode switching.
 
 2. **The resolver respects config, but defaults to WAL** — after merge,
    `resolve_journal_mode()` returns `wal` unless `database.journal_mode`
-   is explicitly set in config.yaml. We could set it to `delete` to
-   prevent any future callers from attempting WAL.
+   is explicitly set in config.yaml. Now set to `delete` in both the
+   default home and the active profile config (fix #11). Note the gateway
+   resolves config against the **profile** home — setting only
+   `~/.hermes/config.yaml` leaves the profile unprotected.
 
 3. **Independent SQLite modules are a recurring problem** — each new
    upstream module that creates its own `sqlite3.connect` + schema init
    is a potential lock contention source. The shared SessionDB singleton
    only covers `state.db`; these modules have their own DB files.
 
-## Recommended follow-up
+4. **Incidental protection is not a fix** — the surviving callers were
+   harmless only because this host's SQLite 3.45.1 trips the WAL-reset-bug
+   gate (no-wait DELETE path). A runtime upgrade to ≥3.50.7/≥3.51.3 would
+   have re-armed the freeze. And when verifying "no more callers",
+   actually re-run the grep against the tree — the earlier Verification
+   output was written from intent, not from reality.
 
-Set `database.journal_mode: delete` in config.yaml so even if a future
+## Recommended follow-up — DONE (2026-08-13)
+
+~~Set `database.journal_mode: delete` in config.yaml so even if a future
 upstream module calls `apply_wal_with_fallback`, the resolver returns
-`delete` and skips the WAL attempt entirely.
+`delete` and skips the WAL attempt entirely.~~ Applied to both
+`~/.hermes/config.yaml` and `~/.hermes/profiles/zhihui/config.yaml`
+(fix #11). Caveat: `hermes_cli/config_defaults.py` still ships
+`"journal_mode": "wal"` as the factory default — newly provisioned
+profiles inherit it, so repeat fix #11 (or change the shipped default)
+when creating a new profile.
