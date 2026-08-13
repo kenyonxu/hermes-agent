@@ -114,8 +114,9 @@ have left it unprotected. Verified: `resolve_journal_mode()` returns
 
 ### Why the surviving callers had not been freezing the gateway
 
-Incidental protection, not design: this host's SQLite is **3.45.1**, which
-falls inside the WAL-reset-bug range (3.7.0–3.51.2; backports only in
+Incidental protection, not design: the gateway's Python runtime links
+SQLite **3.51.1** (conda python3.13; the system python3 links 3.45.1) —
+both fall inside the WAL-reset-bug range (3.7.0–3.51.2; backports only in
 3.50.7/3.44.6), so `is_sqlite_wal_reset_vulnerable()` gated every
 `apply_wal_with_fallback` call into `_apply_delete_for_wal_reset_bug()` —
 a **no-wait** path that never blocks. Upgrading SQLite to ≥3.50.7 /
@@ -217,11 +218,11 @@ Test evidence after fixes #10–#11 (conda python, pytest 9.0.3):
    only covers `state.db`; these modules have their own DB files.
 
 4. **Incidental protection is not a fix** — the surviving callers were
-   harmless only because this host's SQLite 3.45.1 trips the WAL-reset-bug
-   gate (no-wait DELETE path). A runtime upgrade to ≥3.50.7/≥3.51.3 would
-   have re-armed the freeze. And when verifying "no more callers",
-   actually re-run the grep against the tree — the earlier Verification
-   output was written from intent, not from reality.
+   harmless only because the gateway runtime's SQLite (3.51.1, conda)
+   trips the WAL-reset-bug gate (no-wait DELETE path). A runtime upgrade
+   to ≥3.50.7/≥3.51.3 would have re-armed the freeze. And when verifying
+   "no more callers", actually re-run the grep against the tree — the
+   earlier Verification output was written from intent, not from reality.
 
 ## Recommended follow-up — DONE (2026-08-13)
 
