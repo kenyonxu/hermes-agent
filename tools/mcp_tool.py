@@ -2997,7 +2997,9 @@ class MCPServerTask:
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP transport."""
         _ensure_mcp_sdk()
-        if not _MCP_HTTP_AVAILABLE:
+        # mcp 2.0 removed the legacy streamablehttp_client name but keeps the
+        # modern streamable_http_client used below — accept either API.
+        if not (_MCP_HTTP_AVAILABLE or _MCP_NEW_HTTP):
             raise ImportError(
                 f"MCP server '{self.name}' requires HTTP transport but "
                 "mcp.client.streamable_http is not available. "
@@ -3182,9 +3184,10 @@ class MCPServerTask:
             # http_client is provided, so we wrap in async-with.
             try:
                 async with httpx.AsyncClient(**client_kwargs) as http_client:
-                    async with streamable_http_client(url, http_client=http_client) as (
-                        read_stream, write_stream, _get_session_id,
-                    ):
+                    async with streamable_http_client(url, http_client=http_client) as _http_streams:
+                        # mcp 2.0 stateless transport yields (read, write);
+                        # 1.x yielded (read, write, get_session_id).
+                        read_stream, write_stream = _http_streams[0], _http_streams[1]
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
                             self.initialize_result = await asyncio.wait_for(
@@ -3229,9 +3232,10 @@ class MCPServerTask:
             if _oauth_auth is not None:
                 _http_kwargs["auth"] = _oauth_auth
             try:
-                async with streamablehttp_client(url, **_http_kwargs) as (
-                    read_stream, write_stream, _get_session_id,
-                ):
+                async with streamablehttp_client(url, **_http_kwargs) as _http_streams:
+                    # mcp 2.0 stateless transport yields (read, write);
+                    # 1.x yielded (read, write, get_session_id).
+                    read_stream, write_stream = _http_streams[0], _http_streams[1]
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                         # Bound the handshake (#59349) — see stdio path.
                         self.initialize_result = await asyncio.wait_for(
