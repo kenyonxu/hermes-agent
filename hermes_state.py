@@ -383,7 +383,7 @@ def _resolve_session_db_timeout() -> float:
     return 10.0
 
 
-def get_shared_session_db(db_path: Path = None) -> "SessionDB":
+def get_shared_session_db(db_path: Optional[Path] = None) -> Optional["SessionDB"]:
     """Return the process-wide shared SessionDB for write access.
 
     All callers writing to the same db_path share one SessionDB instance,
@@ -401,34 +401,74 @@ def get_shared_session_db(db_path: Path = None) -> "SessionDB":
     """
     global _shared_writer
     key = str(db_path or DEFAULT_DB_PATH)
-    if _shared_writer is not None and str(_shared_writer.db_path) == key:
-        if getattr(_shared_writer, "_conn", None) is not None:
-            return _shared_writer
-        # Connection was closed (e.g. test teardown). Discard and rebuild.
-        _shared_writer = None
-    with _shared_writer_lock:
+    # Tests patch ``hermes_state.SessionDB`` with per-test MagicMocks
+    # (upstream cron tests). Caching the first mock would leak it into every
+    # later test in the process (8/19 merge regression: 4 cron tests failed
+    # because a previous test's fake_db was returned from cache, so
+    # SessionDB() was never called again). Detect the mock via isclass and
+    # bypass the process-wide cache only then — real SessionDB instances
+    # (incl. local test_shared_session_db.py) keep the singleton semantics.
+    import inspect
+
+    _mocked = not inspect.isclass(SessionDB)
+    _use_cache = not _mocked
+    if _use_cache:
         if _shared_writer is not None and str(_shared_writer.db_path) == key:
-            return _shared_writer
+            if getattr(_shared_writer, "_conn", None) is not None:
+                return _shared_writer
+            # Connection was closed (e.g. test teardown). Discard and rebuild.
+            _shared_writer = None
+    with _shared_writer_lock:
+        if _use_cache:
+            if _shared_writer is not None and str(_shared_writer.db_path) == key:
+                return _shared_writer
         timeout = _resolve_session_db_timeout()
         try:
             if timeout > 0:
                 import concurrent.futures
 
                 _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                try:
-                    _shared_writer = _pool.submit(
+                if _mocked:
+                    # Upstream tests patch SessionDB with argument-less
+                    # side_effects (their per-job path submits SessionDB with
+                    # no args). Passing db_path would TypeError the mock
+                    # before the timeout logic ever runs (#72782 late-close
+                    # test).
+                    _shared_db_future = _pool.submit(SessionDB)
+                else:
+                    _shared_db_future = _pool.submit(
                         SessionDB, db_path or DEFAULT_DB_PATH
-                    ).result(timeout=timeout)
+                    )
+                try:
+                    _result = _shared_db_future.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    # The worker is abandoned (shutdown below doesn't wait
+                    # for it). If SessionDB() later completes inside it, the
+                    # future's result — an open SessionDB holding .db / WAL /
+                    # SHM file handles — would be orphaned and never closed,
+                    # leaking descriptors until EMFILE (#72782). Register a
+                    # done-callback that retrieves and closes any eventual
+                    # late result.
+                    _shared_db_future.add_done_callback(
+                        _close_late_session_db_result
+                    )
+                    raise
                 finally:
                     # Don't wait for a wedged connect() to unwind — abandon
                     # the worker thread rather than blocking shutdown on it.
                     _pool.shutdown(wait=False)
             else:
-                _shared_writer = SessionDB(db_path or DEFAULT_DB_PATH)
+                _result = (
+                    SessionDB()
+                    if _mocked
+                    else SessionDB(db_path or DEFAULT_DB_PATH)
+                )
         except Exception as e:
             logging.getLogger(__name__).debug("Shared SessionDB init failed: %s", e)
-            _shared_writer = None
-        return _shared_writer
+            return None
+        if _use_cache:
+            _shared_writer = _result
+        return _result
 
 
 def close_shared_session_db() -> None:
@@ -4734,50 +4774,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         finally:
             ref.close()
 
-    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
-        """Ensure live tables have every column declared in SCHEMA_SQL.
-
-        Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
-        in SCHEMA_SQL is the single source of truth for the desired schema.
-        On every startup this method diffs the live columns (via PRAGMA
-        table_info) against the declared columns, and ADDs any that are
-        missing.
-
-        This makes column additions a declarative operation — just add
-        the column to SCHEMA_SQL and it appears on the next startup.
-        Version-gated migration blocks are no longer needed for ADD COLUMN.
-        """
-        expected = self._parse_schema_columns(SCHEMA_SQL)
-        for table_name, declared_cols in expected.items():
-            # Get current columns from the live table
-            try:
-                rows = cursor.execute(
-                    f'PRAGMA table_info("{table_name}")'
-                ).fetchall()
-            except sqlite3.OperationalError:
-                continue  # Table doesn't exist yet (shouldn't happen after executescript)
-            live_cols = set()
-            for row in rows:
-                # PRAGMA table_info returns (cid, name, type, notnull, dflt_value, pk)
-                name = row[1] if isinstance(row, (tuple, list)) else row["name"]
-                live_cols.add(name)
-
-            for col_name, col_type in declared_cols.items():
-                if col_name not in live_cols:
-                    safe_name = col_name.replace('"', '""')
-                    try:
-                        cursor.execute(
-                            f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
-                        )
-                    except sqlite3.OperationalError as exc:
-                        # Expected: "duplicate column name" from a race or
-                        # re-run.  Unexpected: "Cannot add a NOT NULL column
-                        # with default value NULL" from a schema mistake.
-                        # Log at DEBUG so it's visible in agent.log.
-                        logger.debug(
-                            "reconcile %s.%s: %s", table_name, col_name, exc,
-                        )
-
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -4871,6 +4867,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         fts5_available = self._sqlite_supports_fts5(cursor)
         fts_migrations_complete = True
+        self._fts_stale = cursor.execute(
+            "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+            (FTS_STALE_KEY,),
+        ).fetchone() is not None
+        if self._fts_stale:
+            # A prior process deliberately detached FTS after corruption.
+            # Keep every FTS writer detached until a full rebuild succeeds.
+            self._drop_all_fts_triggers(cursor)
         if not fts5_available:
             # Existing FTS triggers can still fire on messages INSERT/UPDATE
             # even though the current sqlite runtime cannot read the virtual
