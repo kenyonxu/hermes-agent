@@ -6123,10 +6123,11 @@ def run_job(
                 )
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
-            try:
-                _session_db.close()
-            except (Exception, KeyboardInterrupt) as e:
-                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+            # Local fork (7/23 deadlock fix): do NOT close the shared writer
+            # singleton here — run_job does not own it. It is closed once at
+            # process exit via close_shared_session_db(); closing per-job
+            # would sever the gateway/cron/channel shared connection (#72782
+            # late-result close lives inside get_shared_session_db instead).
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job

@@ -539,6 +539,24 @@ def close_read_only_session_db() -> None:
         _shared_readers_key = None
         _reader_rr = 0
 
+def _close_late_session_db_result(future) -> None:
+    """Done-callback: close a SessionDB whose constructor finished after init timeout.
+
+    Mirrors cron/scheduler.py's callback of the same name (#72782): when the
+    shared-writer init times out, the worker thread is abandoned
+    (``shutdown(wait=False)``) so callers can proceed without a session store.
+    If the constructor later completes inside that abandoned worker, the
+    Future's result — an open SessionDB holding .db / WAL / SHM file
+    handles — would be orphaned and never closed, leaking descriptors until
+    EMFILE.  This callback retrieves and closes that eventual late result.
+    """
+    try:
+        db = future.result()
+        if db is not None:
+            db.close()
+    except Exception:
+        pass
+
 # How long SessionDB stops attempting read-only opens after one fails, before
 # probing again. Long enough that a genuinely unreadable file isn't retried per
 # query; short enough that transient fd pressure doesn't strand the read pool.
