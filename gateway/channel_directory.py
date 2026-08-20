@@ -240,7 +240,7 @@ async def _build_channel_directory_impl(adapters: Dict[Any, Any]) -> Dict[str, A
     }
 
     try:
-        atomic_json_write(DIRECTORY_PATH, directory)
+        await asyncio.to_thread(atomic_json_write, DIRECTORY_PATH, directory)
     except Exception as e:
         logger.warning("Channel directory: failed to write: %s", e)
 
