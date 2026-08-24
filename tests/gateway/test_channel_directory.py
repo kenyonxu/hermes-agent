@@ -184,8 +184,7 @@ class TestBuildFromSessions:
         sessions_path.parent.mkdir(parents=True)
         sessions_path.write_text(json.dumps(sessions_data))
 
-    @pytest.mark.asyncio
-    async def test_builds_from_sessions_json(self, tmp_path):
+    def test_builds_from_sessions_json(self, tmp_path):
         self._write_sessions(tmp_path, {
             "session_1": {
                 "origin": {
@@ -212,7 +211,7 @@ class TestBuildFromSessions:
         })
 
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            entries = await _build_from_sessions("telegram")
+            entries = _build_from_sessions("telegram")
 
         assert len(entries) == 2
         names = {e["name"] for e in entries}
@@ -388,10 +387,9 @@ class TestChannelAliases:
         they survive the periodic regeneration, not just live reads."""
         cache_file = tmp_path / "channel_directory.json"
         monkeypatch.setattr("gateway.channel_directory._build_from_sessions",
-                            AsyncMock(side_effect=lambda plat: (
-                                [{"id": "120363@g.us", "name": "120363",
-                                  "type": "group", "thread_id": None}]
-                                if plat == "whatsapp" else [])))
+                            lambda plat: [{"id": "120363@g.us", "name": "120363",
+                                           "type": "group", "thread_id": None}]
+                            if plat == "whatsapp" else [])
         with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
              self._setup_aliases(tmp_path, {"whatsapp": {"120363@g.us": "general"}}):
             asyncio.run(build_channel_directory({}))

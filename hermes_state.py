@@ -4454,7 +4454,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     tracking_path=self.db_path,
                     uri=True,
                     check_same_thread=False,
-                    timeout=30.0,
+                    timeout=1.0,
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
@@ -4534,14 +4534,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._conn = _connect_tracked_db(
                     str(self.db_path),
                     check_same_thread=False,
-                    # 30s busy timeout — waits patiently during write-lock
-                    # contention (e.g. concurrent cron jobs, handoff watcher,
-                    # channel directory) while the application-level retry
-                    # with jitter handles sustained contention. The previous
-                    # 1.0s timeout was too short when multiple threads hit
-                    # SQLite concurrently, causing cascading timeouts that
-                    # froze the gateway (#57921).
-                    timeout=30.0,
+                    # Short timeout — application-level retry with random
+                    # jitter handles contention instead of sitting in
+                    # SQLite's internal busy handler for up to 30s.
+                    # (Local history: #57921 raised this to 30s on 7/14 to
+                    # stop cascading 1s timeouts freezing the gateway; that
+                    # symptom is now covered by the Python-side patience
+                    # loop with tiered budgets — activity 0.5s / routine
+                    # 20s / transcript 60s — plus the 7/23 shared-writer
+                    # singleton. A 30s C-level wait would defeat the
+                    # activity-write short budget contract of #76354 S1.)
+                    timeout=1.0,
                     # auto-starts transactions on DML, which conflicts with
                     # our explicit BEGIN IMMEDIATE.  None = we manage
                     # transactions ourselves.
@@ -5758,14 +5761,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         db_key = str(self.db_path)
         # Bypass cache in test environments so test fixtures work.
+        # NOTE: access via ``self.`` (not the module-global ``SessionDB.``)
+        # so tests that monkeypatch the ``hermes_state.SessionDB`` global
+        # with a factory function don't break real instances resolving
+        # their own class attributes through the MRO.
         _in_test = "PYTEST_CURRENT_TEST" in __import__("os").environ
-        if not _in_test and db_key in SessionDB._initialized_dbs:
+        if not _in_test and db_key in self._initialized_dbs:
             return
 
-        with SessionDB._db_init_lock:
+        with self._db_init_lock:
             # Double-check inside the lock — another thread may have
             # completed _init_schema while we were waiting.
-            if not _in_test and db_key in SessionDB._initialized_dbs:
+            if not _in_test and db_key in self._initialized_dbs:
                 return
 
             cursor = self._conn.cursor()
@@ -6224,7 +6231,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Mark this database as schema-initialised so subsequent SessionDB
         # connections to the same file skip the full DDL + reconciliation.
-        SessionDB._initialized_dbs.add(db_key)
+        # ``self.`` keeps this patch-immune (see _init_schema note).
+        self._initialized_dbs.add(db_key)
 
     # =========================================================================
     # Session lifecycle
