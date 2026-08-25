@@ -205,12 +205,12 @@ import {
 import { cursorPointInWindow } from './hud-cursor'
 import { startHudGameOverlayWatch } from './hud-game-overlay'
 import { applyHudResetBounds, defaultHudBounds } from './hud-geometry'
-import { promoteHudOnHyprland } from './hud-hyprland'
-import { hudInputPolicy } from './hud-input-policy'
 import { registerHudIpc } from './hud-ipc'
+import { applyHudElectronOverlay, promoteHudOverlay } from './hud-overlay'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
+import { resolveHudWindowing } from './hud-windowing'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { createMediaProtocolHandler, MEDIA_PROTOCOL } from './media-protocol'
@@ -340,7 +340,7 @@ import {
 } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
-import { enumerateWindowsFrontToBack, readWindowBelow } from './window-below'
+import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { createWindowRevealController } from './window-reveal'
 import {
@@ -6557,6 +6557,7 @@ function installPreviewShortcut(window) {
 import {
   applyZoomLevel,
   DEFAULT_ZOOM_LEVEL,
+  installZoomReassertOnNavigation,
   installZoomReassertOnWindowEvents,
   percentToZoomLevel,
   ZOOM_STEP,
@@ -11202,13 +11203,15 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
   if (zoom) {
     installZoomShortcuts(win)
     // Re-apply persisted zoom on show/restore/resize/cross-display move
-    // (Chromium can drop webContents zoom after these window transitions) and
-    // on EVERY full load — not once. The crash-recovery path calls
-    // webContents.reload(), which fires did-finish-load again after a `once`
-    // listener is spent, so zoom was silently lost on renderer crash
-    // recovery and any in-place reload/navigation (#46429).
-    installZoomReassertOnWindowEvents(win, () => restorePersistedZoomLevel(win))
-    win.webContents.on('did-finish-load', () => restorePersistedZoomLevel(win))
+    // (Chromium can drop webContents zoom after these window transitions), on
+    // EVERY full load — not once, since crash recovery reloads and would
+    // outlive a spent `once` listener (#46429) — and after in-page navigation,
+    // where Chromium applies the target hash route's own per-URL zoom record
+    // (see installZoomReassertOnNavigation; #48658, #38854, #79863).
+    const reassertZoom = () => restorePersistedZoomLevel(win)
+
+    installZoomReassertOnWindowEvents(win, reassertZoom)
+    installZoomReassertOnNavigation(win.webContents, reassertZoom)
   }
 
   installContextMenuBridge(win)
@@ -11708,8 +11711,12 @@ const HUD_CURSOR_POLL_MS = 60
 // Snap-to-pointer — global ⌘⇧G while the HUD is open (tap, not hold).
 const HUD_SNAP_ANCHOR_Y = 48
 
+function hudWindowing() {
+  return resolveHudWindowing(process.platform, process.env, process.argv)
+}
+
 function applyHudSnapToPointer() {
-  if (!hudWindow || hudWindow.isDestroyed()) {
+  if (!hudWindow || hudWindow.isDestroyed() || !hudWindowing().clientPlacement) {
     return
   }
 
@@ -11763,20 +11770,15 @@ function registerHudSnapShortcut() {
  * the main process.
  */
 function startHudCursorFeed(win: BrowserWindow) {
-  if (process.platform !== 'linux') {
-    return
-  }
+  const windowing = hudWindowing()
 
-  // On an X11 window `setIgnoreMouseEvents(false)` does not restore the input
-  // region once the window has ignored the mouse. Ignore is a one-way door
-  // there, so the HUD is held solid for its whole life (the companion veto
-  // is in the hermes:hud:ignore-mouse handler). Native Wayland keeps the
-  // poll — that is what re-arms click-through when the pointer returns.
-  if (hudInputPolicy(process.platform, process.env, process.argv) === 'solid') {
-    try {
-      win.setIgnoreMouseEvents(false)
-    } catch {
-      // best effort
+  if (!windowing.cursorFeed) {
+    if (!windowing.ignoreMouse) {
+      try {
+        win.setIgnoreMouseEvents(false)
+      } catch {
+        // best effort
+      }
     }
 
     return
@@ -11834,8 +11836,29 @@ function startHudGameOverlayFeed(win: BrowserWindow) {
   // did-finish-load also covers HMR full reloads during development.
   win.webContents.on('did-finish-load', () => push(last))
 
+  // The watch gives up after two failed enumerations and never says so, which
+  // is how a HUD that cannot see the screen at all — no game cue, and
+  // read_window_below failing beside it — leaves nothing in the log to explain
+  // itself. Report the reason once; the null keeps the watch's contract.
+  let reported = false
+
+  const enumerate = async () => {
+    const windows = await enumerateWindowsFrontToBack(process.pid, titlesAvailable)
+
+    if (!enumerationFailed(windows)) {
+      return windows
+    }
+
+    if (!reported) {
+      reported = true
+      console.warn(`[hermes] HUD cannot enumerate windows: ${windows.reason}`)
+    }
+
+    return null
+  }
+
   const dispose = startHudGameOverlayWatch({
-    enumerate: () => enumerateWindowsFrontToBack(process.pid, titlesAvailable),
+    enumerate,
     displayBounds: () => screen.getDisplayMatching(win.getBounds()).bounds,
     selfPid: process.pid,
     send: state => {
@@ -11946,16 +11969,8 @@ function spawnHudWindow(sessionId, profile) {
     webPreferences: chatWindowWebPreferences(PRELOAD_PATH)
   })
 
-  win.setAlwaysOnTop(true, IS_MAC ? 'floating' : 'screen-saver')
+  applyHudElectronOverlay(win, process.platform)
   win.setHiddenInMissionControl?.(true)
-
-  if (IS_MAC) {
-    try {
-      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
-    } catch {
-      // Not supported everywhere — best effort.
-    }
-  }
 
   // Linux intentionally starts on ONE virtual desktop. During a renderer
   // grab, hermes:hud:workspace-transfer temporarily makes the X11 window
@@ -11985,11 +12000,9 @@ function spawnHudWindow(sessionId, profile) {
         mainWindow.hide()
       }
 
-      // Hyprland tiles new toplevels. alwaysOnTop is compositor-owned on
-      // native Wayland, and xdg_toplevel.move is ignored on a tiled window,
-      // so the HUD never becomes an overlay and cannot be dragged. Same
-      // socket as read_window_below; no-op everywhere else.
-      void promoteHudOnHyprland({ title: HUD_WINDOW_TITLE })
+      // Compositor overlay adapters (Hyprland float+pin today). Electron
+      // alwaysOnTop is already set; this is the dialect some WMs actually hear.
+      void promoteHudOverlay({ title: HUD_WINDOW_TITLE })
     }
   })
 
