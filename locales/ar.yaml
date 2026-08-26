@@ -189,6 +189,8 @@ gateway:
       crashed:             "تعطّل (خرج العامل)؛ سيعيد المُوزّع المحاولة"
       timed_out:           "انتهت المهلة؛ سيعيد المُوزّع المحاولة"
       blocked:             "محجوبة؛ تحتاج إلى انتباه"
+      review_requested:    "أُحيلت للمراجعة؛ اكتمل التنفيذ"
+      block_loop_detected: "أُحيلت إلى الفرز بعد تكرار الحجب؛ تحتاج إلى قرار"
       status_default:      "تغيّرت الحالة"
       status_joiner:       "، "
       message:             "[kanban] المهمة {task_id} {status}.\nالعنوان: {title}\nالمُكلَّف: @{assignee}\nاللوحة: {board}\n\nراجع النتيجة أو قرّر الخطوة التالية."
@@ -300,6 +302,8 @@ gateway:
     invalid_number:        "رقم نقطة تحقّق غير صالح. استخدم 1-{max}."
     restored:              "✅ استُعيد إلى نقطة التحقّق {hash}: {reason}\nحُفظت لقطة ما قبل التراجع تلقائيًا."
     kept_user_edits:       "↷ احتُفظ بتعديلاتك اليدوية: {files}\nاستخدم ‎/rollback <N> --all لاستعادتها أيضًا."
+    kept_oversize:         "↷ احتُفظ به (أكبر من أن يُحفظ في نقاط التفتيش، لا توجد نسخة مخزنة للرجوع إليها): {files}"
+    failed_deletes:        "⚠️ تعذّرت الإزالة (تُرك الملف في مكانه): {files}"
     restore_failed:        "❌ {error}"
 
   diff:
