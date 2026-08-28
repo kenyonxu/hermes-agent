@@ -127,7 +127,42 @@ No code or config changes were made during this incident.
 | 2 | Write the delivery obligation BEFORE attempting the send | hermes-agent (upstream-able) | Lets the existing obligation-recovery worker adopt and redeliver losses |
 | 3 | Align empty-string semantics of `allowed_channels`/`free_response_channels` between admission gate and backfill scope (or explicitly configure `missed_message_backfill.channels`) | local config + upstream discussion | Quickest local mitigation: list the active thread/channel IDs |
 | 4 | Investigate why the backfill task produced zero logs after restart | hermes-agent | Possibly never scheduled on fresh connect |
-| 5 | mihomo line-availability detection + switching (probe Discord through the current node; `PUT /proxies/Proxy` to switch; `DELETE /connections` to force the ws to re-dial) | local ops | Environmental layer; reduces black-hole frequency (see 08-22 note below) |
+| 5 | mihomo line-availability detection + switching (probe Discord through the current node; `PUT /proxies/Proxy` to switch; `DELETE /connections` to force the ws to re-dial) | local ops | **IMPLEMENTED 2026-08-28** — see update below |
+
+## Update 2026-08-28 — line watchdog implemented (fix #5)
+
+The predicted failure recurred the same morning: from ~08:33 the TW1 node
+passed generic traffic (gstatic 204 in 0.7s) while timing out on Discord
+(5s), and the gateway burned an hour in reconnect backoff + watchdog
+restarts. Manual switch to 🇹🇼 TW4 台湾_HY2 restored Discord in 4s. The
+auto-switch mechanism was then implemented and deployed:
+
+- **Script**: `~/.hermes/profiles/zhihui/scripts/discord-line-watchdog.sh`
+  (systemd: `hermes-discord-line-watchdog.timer`, every 2 min).
+- **Probe matrix**: Discord `GET /api/v10/gateway` via the SOCKS port ×3
+  (first success = healthy; ≥2/3 fail = line fault) with a generic-URL
+  control probe — if both paths are down it logs SKIP (switching cannot
+  help) and leaves the gateway watchdog in charge.
+- **Selection**: `GET /group/Proxy/delay?url=discord.com`, excluding
+  nested groups (Auto's gstatic health check is exactly the blind spot),
+  DIRECT/REJECT, the current node, and nodes tried in the last 30 min
+  (state file prevents flip-flopping between two bad nodes; both old and
+  new nodes are recorded on each switch).
+- **Redial**: after a verified switch it DELETEs ONLY the Discord
+  connections (`/connections/{id}` filtered by host) so discord.py's own
+  reconnect lands on the new line within seconds — other proxied traffic
+  (e.g. in-flight LLM API calls) is never touched.
+- **Verified**: bash -n; live healthy-path run; mock-mihomo test of the
+  full switch branch (ranking/exclusion, PUT payload, tried-file writes,
+  targeted DELETE hitting only the Discord connection); two live timer
+  ticks logging OK. Env overrides (`LINE_WD_*`) make every branch
+  testable without touching the live proxy.
+
+Remaining known gaps (deliberate, for now): single switch per run (next
+candidate on the next tick, ~2 min later); no quota/expiry awareness
+(nodes are inlined, so mihomo exposes no `subscriptionInfo`); TW1 is
+eligible again after the 30-min TTL, which is intended (its failures are
+intermittent, not permanent).
 
 ## Related prior incidents
 
