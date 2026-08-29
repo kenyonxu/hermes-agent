@@ -79,6 +79,40 @@ _HERMES_SLACK_USER_AGENT_PREFIX = f"HermesAgent/{_HERMES_VERSION}"
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
 
 
+def _slack_unfurl_kwargs(extra: Optional[Dict[str, Any]]) -> Dict[str, bool]:
+    """Return explicitly configured Slack link-preview controls.
+
+    Omitting a key preserves Slack's existing default.  Passing ``False``
+    suppresses only the automatic preview while leaving the link text and URL
+    in the message untouched.
+
+    String booleans are coerced the same way as the relay plane's
+    ``_slack_unfurl_hints``: ``hermes config set`` and Railway persist YAML
+    ``"true"``/``"false"`` as strings, and a silently dropped string would
+    make the knob a no-op on the native plane only. Unrecognized values are
+    dropped (NOT coerced to False) so junk config keeps Slack's default
+    instead of accidentally suppressing previews.
+    """
+    settings = extra or {}
+    kwargs: Dict[str, bool] = {}
+    for key in ("unfurl_links", "unfurl_media"):
+        val = settings.get(key)
+        if isinstance(val, bool):
+            kwargs[key] = val
+        elif isinstance(val, str) and val.strip().lower() in {
+            "1",
+            "0",
+            "true",
+            "false",
+            "yes",
+            "no",
+            "on",
+            "off",
+        }:
+            kwargs[key] = val.strip().lower() in {"1", "true", "yes", "on"}
+    return kwargs
+
+
 async def _read_error_text_limited(
     response: Any,
     *,
@@ -2391,6 +2425,14 @@ class SlackAdapter(BasePlatformAdapter):
                     len(_plugin_handlers),
                 )
 
+            # Generic plugin-registered native handlers
+            # (ctx.register_platform_handler("slack", ...)). Factories get
+            # the slack_bolt AsyncApp — the full app.event()/app.action()/
+            # app.command() surface, not just Block Kit actions. Wired
+            # before Socket Mode starts so bolt's matcher knows about them
+            # before events dispatch.
+            self._wire_plugin_handlers(self._app)
+
             # Bring up the handler and watchdog atomically. ``_running`` only
             # flips to True after the handler is alive so the watchdog loop
             # observes the live task immediately; on any failure here we tear
@@ -2988,6 +3030,7 @@ class SlackAdapter(BasePlatformAdapter):
                     "channel": chat_id,
                     "text": chunk,
                     "mrkdwn": True,
+                    **_slack_unfurl_kwargs(self.config.extra),
                 }
                 if blocks and i == 0:
                     kwargs["blocks"] = blocks
@@ -3317,8 +3360,13 @@ class SlackAdapter(BasePlatformAdapter):
         chat_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Slack native streaming works in DMs, threads, and channels."""
+        """Return whether Slack's native stream can preserve configured behavior."""
         if self._native_stream_unsupported:
+            return False
+        # Slack's chat.*Stream API contract has no unfurl controls. Route
+        # explicitly configured behavior through the edit-based transport,
+        # whose initial chat.postMessage carries these options.
+        if _slack_unfurl_kwargs(self.config.extra):
             return False
         return self._app is not None
 
@@ -5045,6 +5093,27 @@ class SlackAdapter(BasePlatformAdapter):
             "user_id": user_id,
         }
 
+    def _remember_processed_message_ts(self, ts: str) -> None:
+        """Mark a Slack message ts as claimed by this handler.
+
+        Used by the ``message_changed`` guard to tell "we already took this
+        message" from "this is new". Called on ENTRY (so an unfurl arriving
+        mid-flight is suppressed) and again after successful construction
+        (refreshing recency so the LRU keeps genuinely active messages).
+
+        Bounded by ``_PROCESSED_MESSAGE_TS_MAX``: oldest entries are evicted
+        first so a busy workspace cannot grow this map without limit.
+        """
+        if not ts:
+            return
+        self._processed_message_ts[ts] = time.time()
+        if len(self._processed_message_ts) > self._PROCESSED_MESSAGE_TS_MAX:
+            newest_items = sorted(
+                self._processed_message_ts.items(),
+                key=lambda item: item[1],
+            )[-self._PROCESSED_MESSAGE_TS_MAX :]
+            self._processed_message_ts = dict(newest_items)
+
     @staticmethod
     def _event_team_id(event: dict, body: Optional[dict] = None) -> str:
         """Resolve a workspace ID from an event plus Bolt's outer payload.
@@ -5926,6 +5995,43 @@ class SlackAdapter(BasePlatformAdapter):
     async def _handle_slack_message(
         self, event: dict, payload: Optional[dict] = None
     ) -> None:
+        """Handle an incoming Slack message event.
+
+        Thin guard around :meth:`_handle_slack_message_impl`: the impl claims
+        the message ts on entry (before the slow enrichment awaits) so a link
+        unfurl arriving mid-flight can't become a second turn — but a claim
+        held by an invocation that then RAISES would permanently swallow the
+        message: neither a Slack retry nor a user edit could ever re-drive it.
+        So if this invocation newly claimed the ts and then failed, release
+        the claim before re-raising. A ts that was already claimed before we
+        started (the sequential-suppression case) is left untouched.
+        """
+        _ts = str((event or {}).get("ts") or "")
+        # getattr: bare test doubles (object.__new__) may lack the map.
+        _claims = getattr(self, "_processed_message_ts", None)
+        _was_claimed = bool(_ts) and _claims is not None and _ts in _claims
+        try:
+            return await self._handle_slack_message_impl(event, payload)
+        except BaseException:
+            _claims = getattr(self, "_processed_message_ts", None)
+            if (
+                _ts
+                and not _was_claimed
+                and _claims is not None
+                and _ts in _claims
+            ):
+                _claims.pop(_ts, None)
+                logger.warning(
+                    "[%s] handler failed after claiming ts=%s; claim released "
+                    "so a retry or edit can re-drive the turn",
+                    self.name,
+                    _ts,
+                )
+            raise
+
+    async def _handle_slack_message_impl(
+        self, event: dict, payload: Optional[dict] = None
+    ) -> None:
         """Handle an incoming Slack message event."""
         # DEBUG entry log — fires BEFORE any filtering so users debugging
         # bot-to-bot interop, allow_bots config, or SLACK_ALLOWED_USERS
@@ -6415,6 +6521,38 @@ class SlackAdapter(BasePlatformAdapter):
                     chat_type="dm" if is_dm else "group",
                 ):
                     return
+
+        # Claim the underlying message ts now that this event is known to be a
+        # real, deliverable turn — not at the end of the coroutine.
+        #
+        # A link unfurl (or any edit) makes Slack emit `message_changed` for
+        # the SAME message, carrying a DIFFERENT event ts. That different ts
+        # misses the `_dedup` check above by design, so the only thing that
+        # stops it becoming a second user turn is the `_processed_message_ts`
+        # guard at the top of the `message_changed` branch.
+        #
+        # That guard used to be satisfied only after the first copy had walked
+        # the entire handler — thread context, permalink resolution, file
+        # downloads: several awaits and hundreds of ms of Slack API latency. An
+        # unfurl arriving inside that window found the guard still empty and
+        # was promoted to a duplicate turn, producing a spurious "Interrupting
+        # current task" plus the same answer twice.
+        #
+        # Observed 2026-08-22 02:23:30-31Z: original ts 1787365409.908499 was
+        # still resolving two permalinks when the unfurl's `message_changed`
+        # (event ts 1787365411.012100) arrived 957ms later.
+        #
+        # Placement matters in BOTH directions. Claiming right after the dedup
+        # check also claims messages the handler then discards (ignored
+        # channel, bot sender, unauthorized user, no mention). That breaks
+        # editing "@bot" INTO a previously ignored message to summon the bot
+        # (test_message_edit_with_new_mention_processed): the ignored original
+        # would claim the ts and the summoning edit would be dropped. So the
+        # claim belongs here — after every filter has passed, before the slow
+        # enrichment awaits that open the race.
+        _claim_ts = str(event.get("ts") or "")
+        if _claim_ts:
+            self._remember_processed_message_ts(_claim_ts)
 
         if is_mentioned:
             # Strip the bot mention from the text
@@ -7010,13 +7148,7 @@ class SlackAdapter(BasePlatformAdapter):
             )
 
         if ts:
-            self._processed_message_ts[ts] = time.time()
-            if len(self._processed_message_ts) > self._PROCESSED_MESSAGE_TS_MAX:
-                newest_items = sorted(
-                    self._processed_message_ts.items(),
-                    key=lambda item: item[1],
-                )[-self._PROCESSED_MESSAGE_TS_MAX :]
-                self._processed_message_ts = dict(newest_items)
+            self._remember_processed_message_ts(ts)
 
         await self.handle_message(msg_event)
 
@@ -9292,8 +9424,10 @@ async def _standalone_send(
     treats every upload as a generic file share.
 
     When ``caption`` is set (single captionable MEDIA:<path> + short text), the
-    text rides as ``initial_comment`` on the upload instead of a separate
-    ``chat.postMessage``.
+    text normally rides as ``initial_comment`` on the upload instead of a
+    separate ``chat.postMessage``. If link-preview controls are explicit, the
+    text is posted separately because Slack's file-upload API cannot carry
+    those controls.
     """
     del force_document  # signature parity with other standalone senders
     # Profile-scoped read: under multiplex os.environ may hold ANOTHER
@@ -9363,6 +9497,7 @@ async def _standalone_send(
 
     formatted = _format_mrkdwn(message) if message else message
     formatted_caption = _format_mrkdwn(caption) if caption else caption
+    unfurl_kwargs = _slack_unfurl_kwargs(getattr(pconfig, "extra", None))
 
     # --- Media path: AsyncWebClient.files_upload_v2 (+ optional text) ---
     if media_files:
@@ -9383,13 +9518,19 @@ async def _standalone_send(
         _apply_slack_proxy(client, resolve_proxy_url())
         last_message_id = None
 
-        # Caption mode: skip a separate text post; comment rides the upload.
-        text_to_send = "" if formatted_caption else (formatted or "")
+        # Slack's file-upload API cannot accept chat.postMessage's unfurl
+        # controls. When either control is explicit, keep the caption as a
+        # separate text post so the configured behavior is actually honored.
+        caption_as_upload_comment = bool(formatted_caption) and not unfurl_kwargs
+        text_to_send = (
+            "" if caption_as_upload_comment else (formatted_caption or formatted or "")
+        )
         if text_to_send.strip():
             post_kwargs: Dict[str, Any] = {
                 "channel": chat_id,
                 "text": text_to_send,
                 "mrkdwn": True,
+                **unfurl_kwargs,
             }
             if thread_id:
                 post_kwargs["thread_ts"] = thread_id
@@ -9405,7 +9546,7 @@ async def _standalone_send(
             except Exception as e:
                 return {"error": f"Slack send failed: {e}"}
 
-        caption_pending = bool(formatted_caption)
+        caption_pending = caption_as_upload_comment
         uploaded_any = False
         for media_path, _is_voice in media_files:
             if not os.path.exists(media_path):
@@ -9419,6 +9560,7 @@ async def _standalone_send(
                             "channel": chat_id,
                             "text": formatted_caption,
                             "mrkdwn": True,
+                            **unfurl_kwargs,
                         }
                         if thread_id:
                             fallback_kwargs["thread_ts"] = thread_id
@@ -9439,7 +9581,7 @@ async def _standalone_send(
                     client,
                     chat_id,
                     media_path,
-                    initial_comment=formatted_caption if caption_pending else "",
+                    initial_comment=(formatted_caption or "") if caption_pending else "",
                     thread_id=thread_id,
                 )
                 if upload_result.get("error"):
@@ -9505,7 +9647,12 @@ async def _standalone_send(
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw
         ) as session:
-            payload = {"channel": chat_id, "text": formatted, "mrkdwn": True}
+            payload = {
+                "channel": chat_id,
+                "text": formatted,
+                "mrkdwn": True,
+                **unfurl_kwargs,
+            }
             if thread_id:
                 payload["thread_ts"] = thread_id
             for tok in tokens:
