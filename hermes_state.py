@@ -424,7 +424,16 @@ def get_shared_session_db(db_path: Optional[Path] = None) -> Optional["SessionDB
     # (incl. local test_shared_session_db.py) keep the singleton semantics.
     import inspect
 
-    _mocked = not inspect.isclass(SessionDB)
+    # ``__module__`` check: a genuine session replacement class defined inside
+    # a test module (upstream cron tests' _RecordingSessionDB) IS a class, so
+    # isclass alone lets it into the process-wide cache — then the cache-hit
+    # probe touches ``_shared_writer.db_path``, which the fake lacks
+    # (8/30 merge regression: 3 upstream cron tests IndexError'd). Treat any
+    # SessionDB not defined in this module as a test double.
+    _mocked = (
+        not inspect.isclass(SessionDB)
+        or SessionDB.__module__ != __name__
+    )
     _use_cache = not _mocked
     if _use_cache:
         if _shared_writer is not None and str(_shared_writer.db_path) == key:
