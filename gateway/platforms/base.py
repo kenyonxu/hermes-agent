@@ -5654,6 +5654,61 @@ class BasePlatformAdapter(ABC):
             return self
         return live_adapter
 
+    def _send_deadline_seconds(self) -> float:
+        """Per-attempt total deadline for sends inside ``_send_with_retry``.
+
+        A black-holed platform request (request out, response never arrives)
+        never raises, so retry logic alone cannot bound the turn: the await
+        leaks and holds its session active until process restart. Platforms
+        behind flaky egress (e.g. proxied Discord) can override with the
+        ``send_timeout_seconds`` key in their config section.
+        """
+        override = getattr(self, "_send_deadline_override", None)
+        if override:
+            return float(override)
+        extra = getattr(getattr(self, "config", None), "extra", None) or {}
+        try:
+            return max(0.0, float(extra.get("send_timeout_seconds", 60) or 60))
+        except (TypeError, ValueError):
+            return 60.0
+
+    async def _send_with_deadline(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Any = None,
+    ) -> "SendResult":
+        """``self.send`` bounded by ``_send_deadline_seconds``.
+
+        Deadline expiry maps to a non-retryable timeout failure: delivery
+        state is unknown (the request may have been delivered server-side),
+        so the existing ``_is_timeout_error`` semantics in
+        ``_send_with_retry`` — no retry, no plain-text fallback — apply.
+        """
+        deadline = self._send_deadline_seconds()
+        coro = self.send(
+            chat_id=chat_id, content=content, reply_to=reply_to, metadata=metadata
+        )
+        if deadline <= 0:
+            return await coro
+        try:
+            return await asyncio.wait_for(coro, timeout=deadline)
+        except asyncio.TimeoutError:
+            logger.error(
+                "[%s] Send timed out after %.0fs (chat=%s) — delivery state "
+                "unknown; failing without retry to avoid duplicates",
+                self.name,
+                deadline,
+                chat_id,
+            )
+            return SendResult(
+                success=False,
+                error=f"Send timed out after {deadline:.0f}s",
+                retryable=False,
+            )
+
     async def _send_with_retry(
         self,
         chat_id: str,
@@ -5672,7 +5727,7 @@ class BasePlatformAdapter(ABC):
         know to retry rather than waiting indefinitely.
         """
 
-        result = await self.send(
+        result = await self._send_with_deadline(
             chat_id=chat_id,
             content=content,
             reply_to=reply_to,
@@ -5706,7 +5761,7 @@ class BasePlatformAdapter(ABC):
                     self.name, attempt, max_retries, delay, error_str,
                 )
                 await asyncio.sleep(delay)
-                result = await self.send(
+                result = await self._send_with_deadline(
                     chat_id=chat_id,
                     content=content,
                     reply_to=reply_to,
@@ -5728,14 +5783,14 @@ class BasePlatformAdapter(ABC):
                     "Please try again \u2014 your request was processed but the response could not be sent."
                 )
                 try:
-                    await self.send(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
+                    await self._send_with_deadline(chat_id=chat_id, content=notice, reply_to=reply_to, metadata=metadata)
                 except Exception as notify_err:
                     logger.debug("[%s] Could not send delivery-failure notice: %s", self.name, notify_err)
                 return result
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
-        fallback_result = await self.send(
+        fallback_result = await self._send_with_deadline(
             chat_id=chat_id,
             content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
             reply_to=reply_to,
@@ -6734,7 +6789,10 @@ class BasePlatformAdapter(ABC):
                                 )
                                 await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
-                            logger.debug("delivery ledger record failed", exc_info=True)
+                            # Warning, not debug: a swallowed ledger failure
+                            # strips the send of its crash-recovery net — it
+                            # must be visible in errors.log when it happens.
+                            logger.warning("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
                     result = await delivery_adapter._send_with_retry(
                         chat_id=event.source.chat_id,
@@ -6789,7 +6847,7 @@ class BasePlatformAdapter(ABC):
                                             ),
                                         )
                         except Exception:
-                            logger.debug(
+                            logger.warning(
                                 "delivery ledger update failed", exc_info=True
                             )
 
