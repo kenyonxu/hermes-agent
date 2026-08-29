@@ -123,11 +123,66 @@ No code or config changes were made during this incident.
 
 | # | Fix | Layer | Notes |
 |---|-----|-------|-------|
-| 1 | Total timeout (e.g. 60s) + retry around the adapter's final `send()` | hermes-agent (upstream-able) | Treats the disease: a black-holed request can cost at most one timeout window |
-| 2 | Write the delivery obligation BEFORE attempting the send | hermes-agent (upstream-able) | Lets the existing obligation-recovery worker adopt and redeliver losses |
+| 1 | Total timeout (e.g. 60s) + retry around the adapter's final `send()` | hermes-agent (upstream-able) | **IMPLEMENTED 2026-08-28** — see update below |
+| 2 | Write the delivery obligation BEFORE attempting the send | hermes-agent (upstream-able) | Pre-send recording already existed; the silent best-effort swallow was the gap. **IMPLEMENTED 2026-08-28** (visibility fix) |
 | 3 | Align empty-string semantics of `allowed_channels`/`free_response_channels` between admission gate and backfill scope (or explicitly configure `missed_message_backfill.channels`) | local config + upstream discussion | Quickest local mitigation: list the active thread/channel IDs |
 | 4 | Investigate why the backfill task produced zero logs after restart | hermes-agent | Possibly never scheduled on fresh connect |
 | 5 | mihomo line-availability detection + switching (probe Discord through the current node; `PUT /proxies/Proxy` to switch; `DELETE /connections` to force the ws to re-dial) | local ops | **IMPLEMENTED 2026-08-28** — see update below |
+
+## Update 2026-08-29 — fixes #1/#2 implemented; nightly mirror-sync wipe discovered
+
+The black-hole recurred 2026-08-28 16:45 (second occurrence in two days,
+this time on the TW4 line — line-independent, as predicted), after which
+fixes #1/#2 landed. Code inspection refined the original plan:
+
+- `_send_with_retry` (gateway/platforms/base.py) had NO deadline around any
+  of its `await self.send(...)` calls — a hung request never raises, so
+  neither the retry loop nor the delivery-failure notice could ever fire.
+- Pre-send obligation recording (record_obligation → mark_attempting before
+  the send await) already existed and is contract-tested
+  (`tests/gateway/test_delivery_ledger_producer.py`). The gap: failures were
+  swallowed at DEBUG, so a failed ledger write (likely state.db contention)
+  stripped the send of its recovery net invisibly — both incidents' sends
+  have NO obligation row.
+
+Changes (all in `gateway/platforms/base.py`):
+
+1. New `_send_deadline_seconds()` (default 60s; per-platform override via
+   the `send_timeout_seconds` key in the platform config section, or the
+   `_send_deadline_override` attr for tests) and `_send_with_deadline()`.
+   All four send sites inside `_send_with_retry` are bounded. Deadline
+   expiry maps to a non-retryable timeout failure whose error string
+   matches `_is_timeout_error` and NOT `_RETRYABLE_ERROR_PATTERNS`, so the
+   EXISTING timeout semantics apply: no retry (delivery state unknown), no
+   plain-text fallback, turn ends, session released.
+2. Obligation ledger failures now log at WARNING instead of DEBUG.
+
+Regression tests: `tests/gateway/test_send_deadline.py` (5 tests). With the
+producer and stream-contract suites: 18/18 green.
+
+Also applied to the zhihui profile config (compression section):
+`idle_compact_after_seconds: 1800` (idle-time compaction, supported but off
+by default — a 325s blocking compression hit this thread at 16:22 on the
+28th) and `protect_last_n: 20 → 10`.
+
+**Nightly-wipe discovery (2026-08-29):** `git reflog` shows
+`reset: moving to HEAD` every night at 02:30 — the crontab entry for
+`~/.hermes/scripts/sync_github_mirrors.py` hard-resets the working tree
+before mirroring, silently destroying uncommitted changes (it took the
+unpushed #1/#2 fixes the first night; it is also the likely historical
+killer of the never-committed `scripts/gateway_freeze_watchdog.sh`).
+Lesson: in this repo, commit AND push before 02:30 or lose the work. The
+mirror script itself needs a guard (skip reset on dirty tree / stash
+first) — pending, owner's call.
+
+**2026-08-29 11:22 recurrence, different layer:** first message of the
+morning froze mid-send with NO obligation row, NO timeout error — the hang
+is BEFORE the deadline-protected send, in the `asyncio.to_thread` ledger
+write: errors.log shows the turn's superlocalmemory init thread wedged
+("MSLM init thread did not terminate gracefully") seconds earlier, the
+2026-08-13 SQLite global-VFS-mutex convoy class. The whole-process sqlite
+convoy means the to_thread sqlite call never returns and nothing raises.
+Restart clears it. Structural fix still lives in the slm repo.
 
 ## Update 2026-08-28 — line watchdog implemented (fix #5)
 
