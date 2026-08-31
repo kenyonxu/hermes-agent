@@ -2634,6 +2634,7 @@ def _compute_host_turn_frame(
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
         "cwd": _session_cwd(session),
+        "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(session),
         "profile_home": session.get("profile_home") or "",
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
@@ -2849,12 +2850,12 @@ def _status_update(sid: str, kind: str, text: str | None = None):
         return
     out_kind = kind if text is not None else "status"
     # Auto-compaction reaches us as a generic "lifecycle" status. Re-tag it so
-    # drivers (desktop app) can show an explicit "Summarizing…" indicator —
-    # otherwise a mid-turn compaction looks like the transcript reset itself.
+    # drivers (TUI / desktop) can show an explicit summarizing indicator —
+    # otherwise idle/preflight compaction looks like a hung turn (#97239).
     if out_kind == "lifecycle":
-        from agent.conversation_compression import COMPACTION_STATUS_MARKER
+        from agent.conversation_compression import is_compaction_progress_status
 
-        if COMPACTION_STATUS_MARKER in body:
+        if is_compaction_progress_status(body):
             out_kind = "compacting"
     _emit("status.update", sid, {"kind": out_kind, "text": body})
 
@@ -3220,7 +3221,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw = {"session_db": session_db}
+                kw = {
+                    "session_db": session_db,
+                    "context_cwd_is_launch_artifact": (
+                        _context_cwd_is_launch_artifact(current)
+                    ),
+                }
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
@@ -3568,6 +3574,15 @@ def _session_cwd(session: dict | None) -> str:
 _LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
 
 
+def _context_cwd_is_launch_artifact(session: dict | None) -> bool:
+    """Whether the session cwd came from app launch rather than user intent."""
+    return bool(
+        session
+        and not session.get("explicit_cwd")
+        and _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE
+    )
+
+
 def _persisted_session_cwd(session: dict) -> str | None:
     """The cwd to stamp on the session's DB row, or None to leave it unset.
 
@@ -3788,13 +3803,17 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
-def _ensure_session_db_row(session: dict) -> None:
+def _ensure_session_db_row(session: dict) -> bool:
     """Idempotently persist the session's DB row on first real activity.
 
     Called from prompt.submit so a row only exists once the user actually sends
     a message — abandoned drafts never leave an empty "Untitled" session behind.
     Uses INSERT OR IGNORE under the hood, so re-calls (and the AIAgent's own
     lazy create) are no-ops.
+    Returns False only when the store is unavailable (no openable state.db);
+    prompt.submit turns that into an RPC error so a send fails loudly with a
+    toast instead of streaming into a store that will never save it (#98924).
+    Every other outcome — no key, best-effort attempt, success — is True.
 
     A cwd the user *chose* is always persisted. When they made no explicit
     choice the launch directory stands in, and whether that is meaningful
@@ -3824,13 +3843,18 @@ def _ensure_session_db_row(session: dict) -> None:
             db = SessionDB(db_path=Path(profile_home) / "state.db")
         except Exception:
             logger.debug("failed to open profile db for session row", exc_info=True)
-            return
+            return False
         close_db = True
     else:
         db = _get_db()
         close_db = False
     if db is None:
-        return
+        # Fail loud ONLY when the store actually failed to open (#98924):
+        # _db_error records the SessionDB open exception. A None db with no
+        # recorded error means "no store in this context" (degraded harness,
+        # store deliberately absent) — that keeps the pinned best-effort
+        # contract and stays True.
+        return _db_error is None
     # The session's own model/effort/fast pick — the composer override shipped on
     # session.create, or a restored /model switch — must own the row's model +
     # model_config. The agent isn't built yet at first prompt.submit, so derive
@@ -3916,9 +3940,15 @@ def _ensure_session_db_row(session: dict) -> None:
             parent_session_id=parent_session_id,
             cwd=_persisted_session_cwd(session),
             # Self-describing rows: aggregators that merge multiple profile DBs
-            # into one list can't rely on which file a row came from alone. NULL
-            # means the launch/default profile (matches run_agent's convention).
-            profile_name=Path(profile_home).name if profile_home else None,
+            # into one list can't rely on which file a row came from alone.
+            # Stamp the launch profile explicitly instead of leaving NULL —
+            # NULL is exactly what the #94724 legacy-owner backfill exists to
+            # repair, and rows minted AFTER that one-shot backfill ran stayed
+            # NULL forever: profile-keyed matching then drops them from the
+            # sidebar and deep links can't resolve them (#99222).
+            profile_name=(
+                Path(profile_home).name if profile_home else _current_profile_name()
+            ),
         )
         # A session can be born hidden (session.create hidden=true, or a
         # session.set_hidden that arrived before the row existed): apply the
@@ -3943,6 +3973,7 @@ def _ensure_session_db_row(session: dict) -> None:
                 db.close()
             except Exception:
                 pass
+    return True
 
 
 def _persist_branch_seed(session: dict) -> None:
@@ -4430,7 +4461,9 @@ def _save_cfg(cfg: dict):
 
     from utils import atomic_roundtrip_yaml_save
 
-    path = _hermes_home / "config.yaml"
+    override = get_hermes_home_override()
+    home = Path(override) if isinstance(override, str) and override else _hermes_home
+    path = Path(home) / "config.yaml"
     # Comment-, ordering-, and Unicode-preserving full-state write.
     # Replaces the previous `yaml.safe_dump(cfg, f)` (and later
     # `atomic_config_write`, which is not comment-preserving) which clobbered
@@ -8644,6 +8677,9 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            context_cwd_is_launch_artifact=(
+                _context_cwd_is_launch_artifact(session)
+            ),
         )
     finally:
         _clear_session_context(tokens)
@@ -8814,6 +8850,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    context_cwd_is_launch_artifact: bool | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -8943,7 +8980,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -8990,6 +9027,16 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    if context_cwd_is_launch_artifact is None:
+        with _sessions_lock:
+            context_session = _sessions.get(sid)
+        context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(
+            context_session
+        )
+    agent._context_cwd_is_launch_artifact = bool(
+        context_cwd_is_launch_artifact
+    )
+    return agent
 
 
 def _init_session(
@@ -9002,6 +9049,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    explicit_cwd: bool = False,
 ):
     now = time.time()
     with _sessions_lock:
@@ -9018,6 +9066,7 @@ def _init_session(
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
+            "explicit_cwd": bool(explicit_cwd),
             "cols": cols,
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
@@ -9801,6 +9850,12 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     same _run_prompt_submit machinery as every other synthesized turn — so
     the client that just resumed streams it live.
     """
+    # Hosted room turns are recovered by their durable task/lease state
+    # machine. Generic session auto-continue would bypass its execution
+    # generation and can duplicate work after a process restart.
+    if session.get("source") == "bot_room":
+        return None
+
     home = _session_home(session)
     marker = read_turn_marker(home, session_key)
     if marker is None:
@@ -10280,7 +10335,12 @@ def _inflight_snapshot(session: dict) -> dict | None:
 
 
 def _emit_terminal_turn_error(
-    sid: str, session: dict, error: Any, error_surface: Optional[dict] = None
+    sid: str,
+    session: dict,
+    error: Any,
+    error_surface: Optional[dict] = None,
+    *,
+    retire_marker: bool = True,
 ) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
@@ -10333,7 +10393,8 @@ def _emit_terminal_turn_error(
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
-    _retire_turn_marker(session)
+    if retire_marker:
+        _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
 
@@ -10411,6 +10472,7 @@ def _deferred_session_record(
     model_override=None,
     resume_runtime_overrides: dict | None = None,
     todo_state: dict | None = None,
+    explicit_cwd: bool = False,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -10427,7 +10489,7 @@ def _deferred_session_record(
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {},
-        "explicit_cwd": False,
+        "explicit_cwd": bool(explicit_cwd),
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,
@@ -12579,6 +12641,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    terminal_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -12628,6 +12691,8 @@ def _run_prompt_submit(
     _emit("message.start", sid)
 
     def run():
+        terminal_receipt_attempted = False
+        terminal_receipt_committed = terminal_callback is None
         # The conversation runs on a fresh thread, so ContextVars from the RPC
         # dispatcher do not follow automatically. Rebind the exact transport
         # stored on this session generation before any tool can commission a
@@ -13168,7 +13233,26 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
-            _retire_turn_marker(session, marker_key)
+            if terminal_callback is not None:
+                terminal_receipt_attempted = True
+                terminal_callback(
+                    {
+                        "status": (
+                            "cancelled"
+                            if status == "interrupted"
+                            else "failed" if status == "error" else "settled"
+                        ),
+                        "text": raw if isinstance(raw, str) else str(raw),
+                        **(
+                            {"error": str(result.get("error") or raw)}
+                            if status == "error" and isinstance(result, dict)
+                            else {}
+                        ),
+                    }
+                )
+                terminal_receipt_committed = True
+            if terminal_receipt_committed:
+                _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -13348,11 +13432,25 @@ def _run_prompt_submit(
             # Keep the partial turn available to the next prompt; the durable
             # inflight record still carries the recoverable error state.
             _restore_agent_history_after_turn_error(session, agent)
+            if terminal_callback is not None and not terminal_receipt_attempted:
+                terminal_receipt_attempted = True
+                try:
+                    terminal_callback(
+                        {"status": "failed", "text": "", "error": str(e)}
+                    )
+                    terminal_receipt_committed = True
+                except Exception:
+                    logger.exception("hosted room terminal receipt commit failed")
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
                 # the failed turn for resume replay.
-                _emit_terminal_turn_error(sid, session, e)
+                _emit_terminal_turn_error(
+                    sid,
+                    session,
+                    e,
+                    retire_marker=terminal_receipt_committed,
+                )
                 turn_error_retained = True
             except Exception as emit_exc:
                 print(
@@ -13447,7 +13545,10 @@ def _run_prompt_submit(
             )
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
-            _retire_turn_marker(session, marker_key)
+            if terminal_receipt_committed:
+                _retire_turn_marker(session, marker_key)
+                with session["history_lock"]:
+                    session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
 
@@ -13868,6 +13969,7 @@ def _respond(rid, params, key, *, allow_expired=False):
 # opt/model-resolution-core PR touches its body; move it to methods_config.py
 # in a follow-up once that PR lands.
 @method("config.set")
+@_profile_scoped
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))

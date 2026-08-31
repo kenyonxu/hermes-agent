@@ -7639,6 +7639,28 @@ def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):
     assert created[0]["db_path"] == profile_home / "state.db"
 
 
+def test_ensure_session_db_row_stamps_launch_profile_name(monkeypatch):
+    """A launch-profile session row is stamped with the ACTUAL profile name,
+    never NULL. NULL-as-launch-profile rows vanish from the desktop sidebar
+    (profile-keyed matching) and break @session:<profile>/<id> deep links, and
+    the #94724 one-shot backfill cannot keep repairing rows minted after it
+    ran (#99222)."""
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, **kwargs):
+            created.append({"key": key, "profile_name": kwargs.get("profile_name")})
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+
+    server._ensure_session_db_row({"session_key": "k1"})
+
+    assert created and created[0]["key"] == "k1"
+    assert created[0]["profile_name"] == "default"
+
+
 def test_session_title_clears_pending_after_persist(monkeypatch):
     class _FakeDB:
         def __init__(self):
@@ -14252,6 +14274,61 @@ def test_get_db_degrades_cleanly_when_sessiondb_init_fails(monkeypatch):
 
     assert server._get_db() is None
     assert server._db_error == "locking protocol"
+
+
+def test_ensure_session_db_row_false_when_store_unavailable(monkeypatch):
+    """Store unavailable → False, so prompt.submit can fail the send loudly
+    instead of streaming into a store that will never save it (#98924)."""
+    fake_mod = types.ModuleType("hermes_state")
+
+    class _BrokenSessionDB:
+        def __init__(self):
+            raise RuntimeError("utf-8 boom")
+
+    fake_mod.SessionDB = _BrokenSessionDB
+    monkeypatch.setitem(sys.modules, "hermes_state", fake_mod)
+    monkeypatch.setattr(server, "_db", None)
+    monkeypatch.setattr(server, "_db_error", None)
+
+    assert server._ensure_session_db_row({"session_key": "k1"}) is False
+
+
+def test_ensure_session_db_row_true_when_row_persisted(monkeypatch):
+    created = []
+
+    class _FakeDB:
+        def create_session(self, key, **_kwargs):
+            created.append(key)
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+    assert server._ensure_session_db_row({"session_key": "k1", "cwd": "/tmp"}) is True
+    assert created == ["k1"]
+
+
+def test_prompt_submit_fails_loudly_when_store_unavailable(monkeypatch):
+    """A send with no persistable store must fail the RPC with a real error
+    (desktop maps it to a toast) instead of streaming the message into a
+    store that will never save it (#98924)."""
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {}})
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_db_error", "utf-8 decode failure")
+
+    server._sessions["lost-sid"] = _session()
+    try:
+        resp = server.handle_request(
+            {
+                "id": "lost",
+                "method": "prompt.submit",
+                "params": {"session_id": "lost-sid", "text": "will vanish"},
+            }
+        )
+    finally:
+        server._sessions.pop("lost-sid", None)
+
+    assert resp["error"]["code"] == 5072
+    assert "session storage unavailable" in resp["error"]["message"]
 
 
 @pytest.mark.real_agent_prewarm
