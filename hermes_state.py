@@ -51,7 +51,7 @@ from agent.skill_commands import (
     SKILL_SCAFFOLD_SQL_LIKE,
     describe_skill_invocation,
 )
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_hermes_home_override
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
@@ -364,7 +364,35 @@ T = TypeVar("T")
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
 _shared_writer: Optional["SessionDB"] = None
+# Per-resolved-path writer cache (9/1): the shared-writer invariant is
+# "one writer per DB FILE", not "one writer per process". A multiplex
+# profile cron run must construct and cache ITS OWN state.db writer, not
+# share the default home's — the upstream #multiplex-profile regression
+# test constructs SessionDB under an active profile override and asserts
+# the profile's home was used. Different files never contend on the same
+# WAL, so per-path singletons preserve the 7/23 deadlock fix exactly.
+_shared_writers: dict = {}
 _shared_writer_lock = threading.Lock()
+
+
+def _resolve_shared_db_path(db_path: Optional[Path] = None) -> Path:
+    """Resolve which state DB file this call targets.
+
+    Precedence:
+
+    1. An explicit ``db_path`` argument.
+    2. The active hermes-home override (multiplex profile cron runs set
+       one for the duration of a job), resolved at call time.
+    3. ``_default_db_path()`` — the module default, which still honours
+       the test escape hatch of monkeypatching ``DEFAULT_DB_PATH`` and a
+       runtime ``HERMES_HOME`` redirect.
+    """
+    if db_path is not None:
+        return Path(db_path)
+    override = get_hermes_home_override()
+    if override:
+        return Path(override) / "state.db"
+    return _default_db_path()
 
 
 def _resolve_session_db_timeout() -> float:
@@ -404,18 +432,24 @@ def get_shared_session_db(db_path: Optional[Path] = None) -> Optional["SessionDB
     All callers writing to the same db_path share one SessionDB instance,
     one sqlite3.Connection, and one threading.Lock. This eliminates WAL
     write-lock contention between concurrent callers (gateway, cron,
-    session store).
+    session store). Since 9/1 the cache is per RESOLVED path: a multiplex
+    profile cron run (active hermes-home override) gets its own writer for
+    the profile's state.db instead of sharing the default home's — one
+    writer per DB FILE, which is the invariant the 7/23 fix actually needs.
 
     The initial construction is bounded by ``_resolve_session_db_timeout()``
     so a wedged ``sqlite3.connect`` (e.g. a stale flock left by a crashed
     sibling process) cannot block every caller forever: the worker thread is
-    abandoned and subsequent calls return None until the next attempt.
+    abandoned and subsequent calls return None until the next attempt. The
+    worker runs under a copy of the caller's contextvars so profile-aware
+    home resolution behaves identically inside and outside the thread.
 
     Read-only callers should continue to use ``SessionDB(read_only=True)``
     directly — read-only WAL connections never acquire the write lock.
     """
     global _shared_writer
-    key = str(db_path or DEFAULT_DB_PATH)
+    resolved = _resolve_shared_db_path(db_path)
+    key = str(resolved)
     # Tests patch ``hermes_state.SessionDB`` with per-test MagicMocks
     # (upstream cron tests). Caching the first mock would leak it into every
     # later test in the process (8/19 merge regression: 4 cron tests failed
@@ -436,32 +470,48 @@ def get_shared_session_db(db_path: Optional[Path] = None) -> Optional["SessionDB
         or SessionDB.__module__ != __name__
     )
     _use_cache = not _mocked
-    if _use_cache:
-        if _shared_writer is not None and str(_shared_writer.db_path) == key:
-            if getattr(_shared_writer, "_conn", None) is not None:
-                return _shared_writer
+
+    def _cache_get():
+        writer = _shared_writers.get(key)
+        if writer is not None and getattr(writer, "_conn", None) is None:
             # Connection was closed (e.g. test teardown). Discard and rebuild.
-            _shared_writer = None
+            _shared_writers.pop(key, None)
+            writer = None
+        return writer
+
+    if _use_cache:
+        cached = _cache_get()
+        if cached is not None:
+            _shared_writer = cached
+            return cached
     with _shared_writer_lock:
         if _use_cache:
-            if _shared_writer is not None and str(_shared_writer.db_path) == key:
-                return _shared_writer
+            cached = _cache_get()
+            if cached is not None:
+                _shared_writer = cached
+                return cached
         timeout = _resolve_session_db_timeout()
         try:
             if timeout > 0:
                 import concurrent.futures
+                import contextvars
 
                 _pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                # Copy the caller's contextvars into the worker (same as the
+                # upstream per-job path): a multiplex-profile cron run sets a
+                # hermes-home override via ContextVar, and SessionDB's home
+                # resolution must see it inside the worker thread too.
+                _ctx = contextvars.copy_context()
                 if _mocked:
                     # Upstream tests patch SessionDB with argument-less
                     # side_effects (their per-job path submits SessionDB with
                     # no args). Passing db_path would TypeError the mock
                     # before the timeout logic ever runs (#72782 late-close
                     # test).
-                    _shared_db_future = _pool.submit(SessionDB)
+                    _shared_db_future = _pool.submit(_ctx.run, SessionDB)
                 else:
                     _shared_db_future = _pool.submit(
-                        SessionDB, db_path or DEFAULT_DB_PATH
+                        _ctx.run, SessionDB, resolved
                     )
                 try:
                     _result = _shared_db_future.result(timeout=timeout)
@@ -485,18 +535,19 @@ def get_shared_session_db(db_path: Optional[Path] = None) -> Optional["SessionDB
                 _result = (
                     SessionDB()
                     if _mocked
-                    else SessionDB(db_path or DEFAULT_DB_PATH)
+                    else SessionDB(resolved)
                 )
         except Exception as e:
             logging.getLogger(__name__).debug("Shared SessionDB init failed: %s", e)
             return None
         if _use_cache:
+            _shared_writers[key] = _result
             _shared_writer = _result
         return _result
 
 
 def close_shared_session_db() -> None:
-    """Close and reset the shared writer SessionDB singleton."""
+    """Close and reset the shared writer SessionDB singleton(s)."""
     global _shared_writer
     with _shared_writer_lock:
         if _shared_writer is not None:
@@ -505,6 +556,12 @@ def close_shared_session_db() -> None:
             except Exception:
                 pass
             _shared_writer = None
+        for writer in _shared_writers.values():
+            try:
+                writer.close()
+            except Exception:
+                pass
+        _shared_writers.clear()
 
 READER_POOL_SIZE = 3
 _shared_readers: list = []
@@ -6629,7 +6686,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if not _in_test and db_key in self._initialized_dbs:
                 return
 
-            cursor = self._conn.cursor()
+            # self._lock: the writer-conn thread-safety invariant (static
+            # sweep in tests/state/test_writer_conn_thread_safety.py) requires
+            # every self._conn touch in this module to hold the writer lock —
+            # the mixin-era copies live in hermes_state_schema.py where the
+            # sweep doesn't reach, but this local copy (with the init-cache
+            # prologue) does. Schema init is serialized by _db_init_lock and
+            # runs before the instance is shared, so the extra lock is free.
+            with self._lock:
+                cursor = self._conn.cursor()
 
             cursor.executescript(SCHEMA_SQL)
 
@@ -7119,8 +7184,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if getattr(self, "_fts_enabled", False):
                     self._migrate_broad_fts_update_triggers(cursor)
 
-            self._conn.commit()
-
+            with self._lock:
+                self._conn.commit()
 
         # Mark this database as schema-initialised so subsequent SessionDB
         # connections to the same file skip the full DDL + reconciliation.
