@@ -77,7 +77,8 @@ def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     try:
         db = future.result()
         if db is not None:
-            db.close()
+            from hermes_state import release_or_close
+            release_or_close(db)
     except Exception:
         pass
 
@@ -5509,6 +5510,24 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    # Fail closed on a corrupt config.yaml before any agent-driven work
+    # (issue #81952): a cron fire is fully non-interactive, and continuing
+    # on built-in defaults lets provider auto-detection adopt .env
+    # credentials the config never named, billing a provider the user did
+    # not choose. no_agent script jobs are exempt — they never construct an
+    # AIAgent or spend tokens. Escape hatch: HERMES_IGNORE_USER_CONFIG=1.
+    if not job.get("no_agent"):
+        from hermes_cli.config import (
+            InvalidUserConfigError,
+            require_parseable_user_config,
+        )
+
+        try:
+            require_parseable_user_config()
+        except InvalidUserConfigError as exc:
+            logger.error("Job '%s': refusing to run — %s", job_id, exc)
+            return (False, f"# Cron Job: {job_name}\n\nError: {exc}\n", "", str(exc))
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
@@ -6371,22 +6390,58 @@ def run_job(
         # (wake-gate, prompt validation, drift skip) has passed, so a gated
         # run never opens state.db just to abandon the handle (#96290).
         #
-        # Local fork (7/23 deadlock fix): use the scheduler-wide shared
-        # SessionDB instance — avoids per-run _connect_and_init DDL checks
-        # that cause SQLite write-lock contention. The singleton is
-        # initialized with a bounded timeout (see
-        # hermes_state.get_shared_session_db) so a wedged sqlite3.connect
-        # does not block the run — the worker thread is abandoned and
-        # subsequent calls return None (matching the pre-singleton fallback
-        # behavior). #72782 late-result close semantics are absorbed inside
-        # get_shared_session_db.
-        from hermes_state import get_shared_session_db
-        _session_db = get_shared_session_db()
-        if _session_db is None:
-            logger.debug(
-                "Job '%s': shared SQLite session store not available",
-                job.get("id", "?"),
+        # Bounded with its own timeout (separate from HERMES_CRON_TIMEOUT,
+        # which only watches the agent's run_conversation below):
+        # SessionDB.__init__ opens/migrates state.db synchronously and has no
+        # timeout of its own against a wedged sqlite3.connect (e.g. a stale
+        # flock left by a crashed sibling process). An unbounded hang here
+        # would wedge the job's worker thread, so the init is bounded and a
+        # timeout proceeds without a session store instead of blocking the
+        # run forever.
+        _session_db_timeout = _get_session_db_timeout()
+        try:
+            from hermes_state import get_shared_session_db
+
+            if _session_db_timeout > 0:
+                _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                # The timeout worker is a second thread, so it does not inherit
+                # the multiplexed profile ContextVar automatically. Run the
+                # constructor inside a copy of the active context so a profile
+                # cron run resolves ITS OWN home (and state.db) instead of
+                # silently falling back to the process-global default.
+                _session_db_context = contextvars.copy_context()
+                _session_db_future = _session_db_pool.submit(
+                    _session_db_context.run, get_shared_session_db
+                )
+                try:
+                    _session_db = _session_db_future.result(timeout=_session_db_timeout)
+                except concurrent.futures.TimeoutError:
+                    # The worker is abandoned (shutdown below doesn't wait for
+                    # it). If SessionDB() later completes inside it, the
+                    # future's result would be orphaned and its SQLite FDs
+                    # (.db, WAL, SHM) leak until process exit.  Register a
+                    # done-callback that retrieves and closes any eventual
+                    # late result (#72782).
+                    _session_db_future.add_done_callback(_close_late_session_db_result)
+                    raise
+                finally:
+                    # Don't wait for a wedged connect() to unwind — abandon the
+                    # worker thread (same pattern as the agent inactivity
+                    # timeout further down) rather than blocking shutdown on
+                    # it too.
+                    _session_db_pool.shutdown(wait=False)
+            else:
+                # 0 = unlimited (legacy behavior, opt-in for debugging)
+                _session_db = get_shared_session_db()
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "Job '%s': SessionDB init did not return within %.0fs — proceeding "
+                "without a session store for this run instead of blocking it "
+                "forever",
+                job.get("id", "?"), _session_db_timeout,
             )
+        except Exception as e:
+            logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
 
         agent = AIAgent(
             model=model,
@@ -6871,11 +6926,11 @@ def run_job(
                 )
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
-            # Local fork (7/23 deadlock fix): do NOT close the shared writer
-            # singleton here — run_job does not own it. It is closed once at
-            # process exit via close_shared_session_db(); closing per-job
-            # would sever the gateway/cron/channel shared connection (#72782
-            # late-result close lives inside get_shared_session_db instead).
+            try:
+                from hermes_state import release_or_close
+                release_or_close(_session_db)
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job

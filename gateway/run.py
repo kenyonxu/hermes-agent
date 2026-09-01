@@ -6963,6 +6963,14 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            # Thread the platform-side inbound message id onto the persisted
+            # user turn so a turn interrupted by a gateway restart is durably
+            # recorded WITH its id — restart drain-window recovery dedups
+            # against has_platform_message_id, and without this the
+            # interrupted turn is invisible to that check. Uses the raw
+            # inbound id (NOT event_message_id, which is the reply anchor).
+            if ctx.inbound_message_id is not None:
+                _conversation_kwargs["persist_user_platform_id"] = str(ctx.inbound_message_id)
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -7855,7 +7863,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         failure after recording that recoverable state so ``__init__`` can
         record ``_session_db_init_error`` for the #88235 broadcast.
         """
-        from hermes_state import AsyncSessionDB, SessionDB, _default_db_path
+        from hermes_state import AsyncSessionDB, SessionDB, _default_db_path, get_shared_session_db
         from gateway.session_db_recovery import RecoverableHandleCache
 
         path = Path(_default_db_path())
@@ -7897,7 +7905,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # unavailability the store is already reporting.
                 raise RuntimeError("SessionStore SQLite handle unavailable")
             try:
-                return AsyncSessionDB(SessionDB())
+                return AsyncSessionDB(get_shared_session_db())
             except Exception as exc:
                 logger.warning("SQLite session store not available: %s", exc)
                 raise
@@ -7948,8 +7956,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             inner = getattr(db, "_db", db)
             if inner is None or not hasattr(inner, "close"):
                 return
+            from hermes_state import release_or_close
             try:
-                inner.close()
+                release_or_close(inner)
             except Exception as exc:
                 logger.debug("SessionDB close error during handle sweep: %s", exc)
 
@@ -9868,7 +9877,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         while self._running:
             try:
-                if drain_requested():
+                # drain_requested() does a synchronous read_text() on the
+                # marker file. At this 1s cadence that puts a blocking disk
+                # read on the event loop ~86k times a day; when the host is
+                # under I/O pressure a single read can stall for 30s+ and
+                # take every platform heartbeat down with it. Off-thread it.
+                if await asyncio.to_thread(drain_requested):
                     self._enter_external_drain()
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
@@ -10665,6 +10679,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "platform": platform,
                     "chat_id": getattr(source, "chat_id", "") or "",
                     "user_id": getattr(source, "user_id", "") or "",
+                    # Writer identity for re-entrancy (#94595): if this
+                    # process leaks a lease for this session (exception path
+                    # skipped release), the next turn re-acquires its own
+                    # entry instead of being fenced out of it forever —
+                    # pruning only reclaims entries whose PROCESS died.
+                    "live_session_id": str(session_key),
                 },
             )
         except Exception as exc:
@@ -13467,6 +13487,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._gateway_loop = None
         if self._gateway_loop is not None:
             self._start_loop_liveness_guards(self._gateway_loop)
+            # The event loop is confirmed live: the startup-liveness
+            # watchdog's job is done and the loop-liveness watchdog (armed
+            # just above) takes over from here (OOF-298). Disarm even when
+            # the loop guards are config-disabled — the startup watchdog
+            # only covers the pre-loop window, never adapter connects or
+            # steady-state. Deliberately inside the loop-confirmed branch:
+            # if the loop somehow isn't live, startup has NOT reached the
+            # milestone and the watchdog must stay armed.
+            try:
+                from gateway.startup_watchdog import disarm_startup_watchdog
+
+                disarm_startup_watchdog()
+            except Exception:
+                logger.debug("Startup watchdog disarm failed", exc_info=True)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
@@ -16448,6 +16482,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 GatewayRunner.close_all_session_db_handles(self)
             except Exception as _e:
                 logger.debug("Runner SessionDB handle sweep error: %s", _e)
+            # Final sweep: close any shared SessionDB instances still held by
+            # the process-wide registry (in-process tools, cron, mirror, etc.
+            # that opened via get_shared_session_db but weren't released by
+            # the sweeps above).  This is the safety net that guarantees no
+            # WAL write lock survives past gateway shutdown (#90837).
+            try:
+                from hermes_state import close_shared_session_dbs
+                closed = close_shared_session_dbs()
+                if closed:
+                    logger.debug("Closed %d shared SessionDB instance(s) at shutdown", closed)
+            except Exception as _e:
+                logger.debug("Shared SessionDB close error: %s", _e)
             GatewayRunner._shutdown_executor(self)
             logger.info(
                 "Shutdown phase: SessionDB close done at +%.2fs",
@@ -18555,26 +18601,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # immediately evict them, racing with the setup path.
             _stale_idle = float("inf")  # assume idle if we can't check
             _stale_detail = ""
+            _activity_summary_valid = False
             if _stale_agent and hasattr(_stale_agent, "get_activity_summary"):
                 try:
                     _sa = _stale_agent.get_activity_summary()
-                    _stale_idle = _sa.get("seconds_since_activity", float("inf"))
+                    from gateway.session_stall import (
+                        resolve_session_idle_seconds_from_activity,
+                    )
+
+                    _resolved_idle = resolve_session_idle_seconds_from_activity(
+                        _sa if isinstance(_sa, dict) else None,
+                        now=time.time(),
+                    )
+                    if _resolved_idle is not None:
+                        _stale_idle = _resolved_idle
+                        _activity_summary_valid = True
                     _stale_detail = (
-                        f" | last_activity={_sa.get('last_activity_desc', 'unknown')} "
+                        f" | last_activity={_sa.get('last_activity_desc', 'unknown') if isinstance(_sa, dict) else 'unknown'} "
                         f"({_stale_idle:.0f}s ago) "
-                        f"| iteration={_sa.get('api_call_count', 0)}/{_sa.get('max_iterations', 0)}"
+                        f"| iteration={_sa.get('api_call_count', 0) if isinstance(_sa, dict) else 0}/{_sa.get('max_iterations', 0) if isinstance(_sa, dict) else 0}"
                     )
                 except Exception:
                     pass
-            # Evict if: agent is idle beyond timeout, OR wall-clock age is
-            # extreme (10x timeout or 2h, whichever is larger — catches
-            # cases where the agent object was garbage-collected).
+            # A valid activity clock is authoritative: total age alone never
+            # makes an actively progressing turn stale. The emergency wall TTL
+            # is only a fallback when the agent cannot report usable activity.
             _wall_ttl = max(_raw_stale_timeout * 10, 7200) if _raw_stale_timeout > 0 else float("inf")
             _should_evict = (
                 _stale_agent is not _AGENT_PENDING_SENTINEL
                 and (
-                    (_raw_stale_timeout > 0 and _stale_idle >= _raw_stale_timeout)
-                    or _stale_age > _wall_ttl
+                    (
+                        _activity_summary_valid
+                        and _raw_stale_timeout > 0
+                        and _stale_idle >= _raw_stale_timeout
+                    )
+                    or (
+                        not _activity_summary_valid
+                        and _stale_age > _wall_ttl
+                    )
                 )
             )
             if _should_evict:
@@ -22157,6 +22221,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
+                inbound_message_id=(
+                    str(event.message_id) if event.message_id else None
+                ),
                 channel_prompt=event.channel_prompt,
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
@@ -27070,8 +27137,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     raw_sid = _sk
             if raw_sid:
                 adapter = self.adapters.get(Platform.API_SERVER)
-                from gateway.wake import adapter_supports_push, deliver_wake
+                from gateway.wake import (
+                    adapter_supports_push,
+                    deliver_wake,
+                    persist_delegation_delivery,
+                )
                 if adapter is not None and not adapter_supports_push(adapter):
+                    if evt.get("type") == "async_delegation":
+                        # #85957: after the parent turn's event.complete the
+                        # CLIENT owns the next turn on this stateless surface.
+                        # Persist the completion as a durable delivery row —
+                        # never self-post it as a new role=user prompt.
+                        try:
+                            logger.info(
+                                "Async delegation completion — persisting "
+                                "delivery row for api_server session %s "
+                                "(no wake turn)",
+                                raw_sid,
+                            )
+                            await persist_delegation_delivery(
+                                adapter, text=synth_text,
+                                session_id=raw_sid, evt=evt,
+                            )
+                            return True
+                        except Exception as e:
+                            logger.warning(
+                                "Async delegation delivery persist failed "
+                                "for session %s: %s",
+                                raw_sid, e,
+                            )
+                            return False
                     try:
                         logger.info(
                             "Watch pattern notification — waking api_server "
@@ -27137,8 +27232,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # which binds chat_id = session_id). handle_message would run the
             # wake under a build_session_key()-derived key that never matches
             # the raw X-Hermes-Session-Id session — self-post instead.
-            from gateway.wake import deliver_wake
+            from gateway.wake import deliver_wake, persist_delegation_delivery
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
+            if evt.get("type") == "async_delegation":
+                # #85957: same client-owns-the-turn rule as the raw-key branch
+                # above — persist the completion as a delivery row, never
+                # self-post it as a new role=user prompt.
+                try:
+                    logger.info(
+                        "Async delegation completion — persisting delivery "
+                        "row for api_server session %s (no wake turn)",
+                        raw_sid,
+                    )
+                    await persist_delegation_delivery(
+                        adapter, text=synth_text, session_id=raw_sid, evt=evt,
+                    )
+                    return True
+                except Exception as e:
+                    logger.warning(
+                        "Async delegation delivery persist failed for "
+                        "session %s: %s",
+                        raw_sid, e,
+                    )
+                    return False
             try:
                 logger.info(
                     "Watch pattern notification — waking api_server session "
@@ -29937,6 +30053,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -29958,6 +30075,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -29971,6 +30089,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                inbound_message_id=inbound_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
@@ -30113,6 +30232,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
@@ -30424,6 +30544,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation=run_generation,
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
+            inbound_message_id=inbound_message_id,
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
@@ -32218,17 +32339,18 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         if tick_count % AUTO_ARCHIVE_EVERY == 0:
             try:
                 from hermes_cli.config import load_config as _load_full_config
-                from hermes_state import SessionDB
+                from hermes_state import get_shared_session_db, release_shared_session_db
                 _sess_cfg = (_load_full_config().get("sessions") or {})
                 if _sess_cfg.get("auto_archive", False):
-                    _adb = SessionDB()
+                    _adb = get_shared_session_db()
                     try:
                         _adb.maybe_auto_archive(
                             idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
                             min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
                         )
                     finally:
-                        _adb.close()
+                        from hermes_state import release_or_close
+                        release_or_close(_adb)
             except Exception as e:
                 logger.debug("Auto-archive tick error: %s", e)
 
@@ -32323,6 +32445,45 @@ async def _await_thread_exit(
     while thread.is_alive() and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(poll)
     return not thread.is_alive()
+
+
+async def _shutdown_mcp_servers_nonblocking(timeout: float = 5.0) -> bool:
+    """Close MCP servers off-loop with a bounded wait (#82874).
+
+    ``shutdown_mcp_servers()`` is synchronous and can block for its full
+    internal 15s future wait when the MCP loop and its stdio children are
+    torn down concurrently (every process in the tree gets SIGTERM at once
+    under a container/supervisor stop). Calling it directly from the gateway
+    event-loop thread freezes the loop for that whole window, so supervisors
+    with a shorter kill grace (s6-overlay defaults to 3s) SIGKILL the gateway
+    before ``lifecycle_ledger.mark_exited()`` runs and every subsequent boot
+    reports a phantom unclean death.
+
+    Run it on a daemon thread instead and poll with ``_await_thread_exit`` so
+    the loop keeps servicing teardown. If it does not finish within
+    ``timeout`` we proceed with shutdown; the daemon thread is left to finish
+    (or die with the process) in the background. Returns True when the MCP
+    shutdown completed within the budget.
+    """
+
+    def _do() -> None:
+        try:
+            from tools.mcp_tool import shutdown_mcp_servers
+
+            shutdown_mcp_servers()
+        except Exception:
+            logger.debug("MCP shutdown raised", exc_info=True)
+
+    thread = threading.Thread(target=_do, name="mcp-shutdown", daemon=True)
+    thread.start()
+    done = await _await_thread_exit(thread, timeout=timeout)
+    if not done:
+        logger.warning(
+            "MCP shutdown did not finish within %.1fs; continuing gateway "
+            "teardown (background thread will be reaped at process exit)",
+            timeout,
+        )
+    return done
 
 
 def _shutdown_gateway_health_export(runner: Any) -> None:
@@ -33118,8 +33279,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     logger.error("Gateway exiting with failure: %s", runner.exit_reason)
                 return False
             try:
-                from tools.mcp_tool import shutdown_mcp_servers
-                shutdown_mcp_servers()
+                await _shutdown_mcp_servers_nonblocking()
             except Exception:
                 pass
             if runner.exit_code is not None:
@@ -33299,10 +33459,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
 
-    # Close MCP server connections
+    # Close MCP server connections (off-loop, bounded — #82874)
     try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
+        await _shutdown_mcp_servers_nonblocking()
     except Exception:
         pass
 
@@ -33336,8 +33495,34 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     return True
 
 
+def _guard_corrupt_user_config() -> None:
+    """Fail closed when the active profile's config.yaml cannot be parsed.
+
+    The gateway is a fully non-interactive surface: nobody is present to
+    repair a corrupt ``config.yaml``, and silently continuing on built-in
+    defaults lets provider auto-detection adopt credentials from ``.env``
+    that the config never named (issue #81952). Same policy and escape
+    hatch (``HERMES_IGNORE_USER_CONFIG=1``) as the non-interactive CLI
+    guard in ``hermes_cli/main.py``.
+    """
+    from hermes_cli.config import (
+        InvalidUserConfigError,
+        require_parseable_user_config,
+    )
+
+    try:
+        require_parseable_user_config()
+    except InvalidUserConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
 def main():
     """CLI entry point for the gateway."""
+    # Refuse to start on a corrupt config.yaml — before any config-dependent
+    # startup (watchdog, DB opens, provider resolution). See _guard docstring.
+    _guard_corrupt_user_config()
+
     # Advertise the agent harness to child processes (AI_AGENT is the
     # cross-agent standard; HERMES_AGENT the Hermes-specific marker — see
     # _advertise_agent_env in hermes_cli/main.py, kept inline here to avoid
@@ -33358,6 +33543,19 @@ def main():
 
         register_self("gateway")
         attach_self_to_kill_on_close_job()
+    except Exception:
+        pass
+
+    # Startup-liveness watchdog (OOF-298): armed before config load, DB
+    # opens, and the rest of pre-loop startup so a deadlock in that window
+    # still gets the process respawned by the service supervisor instead of
+    # wedging as a live-PID zombie. (Import-time coverage for the standard
+    # ``hermes gateway run`` path is provided even earlier, by the argv
+    # fast-path in hermes_cli.main.) Disarmed by GatewayRunner once the
+    # event loop is confirmed live.
+    try:
+        from gateway.startup_watchdog import arm_startup_watchdog
+        arm_startup_watchdog()
     except Exception:
         pass
 

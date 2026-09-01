@@ -62,8 +62,10 @@ DEFAULT_CONFIG = {
         # Maximum time an alias routing key waits for the active turn holding
         # the same resolved session lease. On expiry the inbound message is
         # rejected with a resend notice rather than run without serialization.
-        # Non-positive values fall back to 1800 seconds.
-        "gateway_turn_lease_timeout": 1800,
+        # Keep this short: Telegram dispatches updates sequentially, so an
+        # inline lease waiter also delays unrelated topics. Non-positive values
+        # fall back to the five-second safety default.
+        "gateway_turn_lease_timeout": 5,
         # Per-session AIAgent cache in the gateway. Each cached agent keeps a
         # warm prompt prefix AND the session's full transcript, so the cache
         # trades memory for cost: too small and every turn re-pays an uncached
@@ -295,6 +297,14 @@ DEFAULT_CONFIG = {
         # from gateway_timeout (which kills the turn) and
         # gateway_notify_interval ("still working" heartbeats). 0 = disable.
         "session_stall_timeout": 300,
+        # Transcript-sanitiser repeated-heal escalation threshold (#96870).
+        # After this many pre-send heal passes within a 10-minute session
+        # window, log one ERROR (session id + heal pattern) and queue a
+        # ONE-TIME out-of-band user notice pointing at /debug share or
+        # `hermes doctor`. Delivered via the status channel only —
+        # conversation context / prompt caching untouched. 0 = disable
+        # escalation (per-window WARNINGs still fire).
+        "sanitizer_heal_escalation_threshold": 3,
         # Long-lived reconnect-loop escalation (seconds). A platform that has
         # been continuously failing/reconnecting for this long gets
         # needs_attention flagged in gateway runtime status (visible in
@@ -381,6 +391,20 @@ DEFAULT_CONFIG = {
         # ``false`` keeps the historical strict-provider behavior (Mistral,
         # Groq, Cerebras reject the field with HTTP 400).
         "reasoning_echo": False,
+        # Turn liveness watchdog (#95548): a turn that shows no observable
+        # progress (activity-clock idle, never touched by lease renewal) for
+        # `timeout_s` seconds is logged loudly, force-interrupted so the UI
+        # can retry it, and its durable turn lease stops renewing so TTL
+        # expiry lets stale-turn cleanup reclaim the session even when the
+        # hard interrupt cannot unwind a wedged frame. `timeout_s` <= 0
+        # disables the watchdog; `poll_s` is the sampling interval. Invalid
+        # values (typo, NaN, Inf, non-positive poll) warn and fall back to
+        # the default instead of crashing startup or silently disabling the
+        # watchdog. See agent/turn_liveness.py.
+        "turn_liveness": {
+            "timeout_s": 600.0,
+            "poll_s": 15.0,
+        },
     },
 
     "terminal": {
@@ -531,7 +555,7 @@ DEFAULT_CONFIG = {
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
         # Keyless free-tier ring: with NO web backend configured or keyed,
-        # web_search/web_extract rotate round-robin across five vendors'
+        # web_search/web_extract rotate round-robin across four vendors'
         # public free tiers (exa, parallel, firecrawl, keenable),
         # failing over to the next ring vendor on rate limits. Never
         # pre-empts a configured or keyed backend. Set false to disable.
@@ -541,10 +565,11 @@ DEFAULT_CONFIG = {
         # free-tier ring — the next call attempts the chosen backend again
         # (no sticky failover). Off when keyless_fallback is false.
         "keyless_rescue": True,
-        # Per-provider tier selection for ring vendors with both a keyless
+        # Per-provider tier selection for vendors with both a keyless
         # free endpoint and a keyed paid path (exa, parallel,
-        # firecrawl, keenable). Set by the `hermes tools` picker's
-        # "Free (keyless)" / "Paid (API key)" rows.
+        # firecrawl, keenable on the ring; tavily is opt-in keyless via
+        # `hermes tools`, not a ring member). Set by the `hermes tools`
+        # picker's "Free (keyless)" / "Paid (API key)" rows.
         #   free  — always use the anonymous free endpoint (even with a key)
         #   paid  — always use the keyed path (missing key = error; vendor
         #           is also excluded from the keyless ring)
@@ -1709,6 +1734,15 @@ DEFAULT_CONFIG = {
         # override for backward compatibility. 0 disables the reap
         # (park forever).
         "ws_orphan_reap_grace_s": 20.0,
+        # Activity-staleness threshold (seconds) gating the WS-orphan
+        # interrupt of a detached RUNNING turn (#98028/#100325). A
+        # client-absent turn is only interrupted once its agent activity
+        # clock (the same one the agent.turn_liveness watchdog samples —
+        # stamped by API waits, stream tokens, tool heartbeats) has been
+        # idle at least this long; an actively-working detached turn runs
+        # to completion. Default matches agent.turn_liveness.timeout_s.
+        # 0 restores the old interrupt-at-grace-regardless behavior.
+        "ws_orphan_activity_stale_s": 600.0,
         # Startup sweep of session rows orphaned by a dead gateway process
         # (#65194).  The ws-orphan grace timer above is in-process, so a
         # gateway restart (update, crash, systemd) leaves disconnected
@@ -2243,9 +2277,17 @@ DEFAULT_CONFIG = {
 
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
-    # always goes to ~/.hermes/skills/.
+    # goes to ~/.hermes/skills/ unless create_dir (below) redirects it.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Where agent-created skills (skill_manage action=create) are written.
+        # Empty = the profile-local skills dir (~/.hermes/skills/). When set,
+        # new skills land here AND every agent-facing instruction that names
+        # the creation path (tool schema text, prompts) renders this directory
+        # instead of the default. Expanded (~, ${VAR}); relative paths resolve
+        # against HERMES_HOME. The directory is scanned for skills alongside
+        # the local dir. e.g. "/opt/brain/skills"
+        "create_dir": "",
         # Project-local skill discovery: when a session starts inside a git
         # checkout, ``<root>/.hermes/skills/`` and ``<root>/.agents/skills/``
         # are sourced as the highest-precedence skill tier — but ONLY when the
@@ -3212,6 +3254,18 @@ DEFAULT_CONFIG = {
         "loop_watchdog_probe_interval_s": 30.0,
         "loop_watchdog_probe_timeout_s": 10.0,
         "loop_watchdog_max_strikes": 3,
+
+        # Startup-liveness watchdog (OOF-298): plain daemon thread armed at
+        # process entry for gateway runs, hard-exits 75 if the event loop is
+        # not confirmed live within the deadline. The watchdog module itself
+        # is stdlib-only and armed before config can load, so run_gateway()
+        # bridges these keys to the internal HERMES_STARTUP_WATCHDOG /
+        # HERMES_STARTUP_WATCHDOG_TIMEOUT_S env vars AND applies them to the
+        # already-armed handle (disarm on disable, disarm+re-arm on a config
+        # timeout) — config.yaml is the user-facing surface; explicit env
+        # values win as operator override.
+        "startup_watchdog": True,
+        "startup_watchdog_timeout_seconds": 300,
 
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the
@@ -4459,6 +4513,14 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
         "advanced": True,
+    },
+    "TAVILY_API_KEY": {
+        "description": "Tavily API key for AI-native web search and extract (optional — keyless works when Tavily is selected)",
+        "prompt": "Tavily API key",
+        "url": "https://app.tavily.com/home",
+        "tools": ["web_search", "web_extract"],
+        "password": True,
+        "category": "tool",
     },
     "KEENABLE_API_KEY": {
         "description": "Keenable API key for fast independent-index web search and page fetch (optional — keyless free tier works without it)",
