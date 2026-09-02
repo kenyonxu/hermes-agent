@@ -295,7 +295,13 @@ def _hygiene_compression_timeout_message(
     idle_timeout: float,
     progress_observed: bool,
 ) -> str:
-    """Describe the host timeout that actually ended hygiene compression."""
+    """Describe the host timeout that actually ended hygiene compression.
+
+    The user-facing notice must report the *real* elapsed wait (the
+    ~600s total ceiling), not the 30s no-progress check interval —
+    quoting the interval made "model silent" indistinguishable from
+    "model slow" (fork commit 61f4985305, 2026-09-01/02 incidents).
+    """
     if total_exhausted:
         progress = (
             " after summary output was observed" if progress_observed else ""
@@ -307,10 +313,11 @@ def _hygiene_compression_timeout_message(
             "session."
         )
     return (
-        f"⚠️ Context compression timed out after {idle_timeout:.1f}s with no "
-        "output from the summary model. No messages were dropped — continuing "
-        "without compression. Run /compress to retry, /reset for a clean "
-        "session, or check your auxiliary.compression model configuration."
+        f"⚠️ Context compression timed out after {elapsed:.1f}s "
+        f"(idle check {idle_timeout:.1f}s) with no output from the summary "
+        "model. No messages were dropped — continuing without compression. "
+        "Run /compress to retry, /reset for a clean session, or check your "
+        "auxiliary.compression model configuration."
     )
 
 

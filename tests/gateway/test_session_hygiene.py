@@ -165,6 +165,25 @@ def test_hygiene_total_ceiling_warning_reports_elapsed_and_progress():
     assert "no output" not in warning
 
 
+def test_hygiene_idle_timeout_warning_reports_real_elapsed_not_interval():
+    """Fork invariant (61f4985305): the user notice quotes the real elapsed
+    wait (~600s ceiling), never the 30s no-progress check interval — the
+    interval made "model silent" indistinguishable from "model slow"."""
+    from gateway.run import _hygiene_compression_timeout_message
+
+    warning = _hygiene_compression_timeout_message(
+        total_exhausted=False,
+        elapsed=612.0,
+        idle_timeout=30.0,
+        progress_observed=False,
+    )
+
+    assert "timed out after 612.0s" in warning
+    assert "idle check 30.0s" in warning
+    # The check interval must not be quoted as the wait itself.
+    assert "timed out after 30.0s" not in warning
+
+
 class TestSessionHygieneWarnThreshold:
     """Test the post-compression warning threshold (95% of context)."""
 
