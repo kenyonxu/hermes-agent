@@ -20627,8 +20627,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             _timeout_msg = (
                                                 "⚠️ Context compression timed out "
-                                                f"after {_hyg_timeout_seconds:.1f}s "
-                                                "with no output from the summary model. "
+                                                f"after {time.monotonic() - _hyg_wait_started:.0f}s "
+                                                f"(ceiling {_hyg_total_ceiling_seconds:.0f}s; last "
+                                                f"model output {_hyg_commit_fence.seconds_since_progress():.0f}s ago). "
                                                 "No messages were dropped — continuing without "
                                                 "compression. Run /compress to retry, /reset for "
                                                 "a clean session, or check your "
