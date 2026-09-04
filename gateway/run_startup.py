@@ -1206,7 +1206,13 @@ class GatewayStartupMixin:
 
     def _start_spawn_background_watchers(self) -> None:
         """Spawn the long-lived supervised background watchers."""
+        # Fork graft (a22603ae55, 2026-08-08): kanban not in use on this install; the
+        # notifier creates independent kanban.db connections that contend with state.db
+        # under DELETE-mode journal, and the dispatcher is a no-op without kanban users.
+        # Re-applied here after upstream moved the spawn point out of run.py.
         for method in self._PRE_RECONNECT_WATCHERS:
+            if method in ("_kanban_notifier_watcher", "_kanban_dispatcher_watcher"):
+                continue
             self._spawn_supervised(getattr(self, method), method[1:])
         if self._failed_platforms:
             logger.info(
