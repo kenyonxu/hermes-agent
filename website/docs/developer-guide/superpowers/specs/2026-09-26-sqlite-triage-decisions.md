@@ -243,8 +243,11 @@ supersedes、2 个含 keep 块、1 个 arch-diverged；10 个文件与上游字�
 
 ### 环境遗留（2026-09-25 深夜更新：前两项已根治）
 
-- ~~PM workspace mslm 镜像缺口~~ → **已修**：`hermes pm repair` 重建依赖环境成功，`pm status`
-  显示 sync outcome ok。
+- ~~PM workspace mslm 镜像缺口~~ → **已修（但修法与初判不同）**：初判"pm repair 根治"有误——
+  真因是 superlocalmemory 插件把 `mslm-memory>=4.1.0` 声明进 pip_dependencies，而 mslm-memory
+  任何已发布版本都硬钉 websockets==16.0 / mcp==1.x，与 hermes 钉的 15.0.1 / 2.0.0 根本冲突，
+  PM 工作区解析永无解、连带堵死所有平台 extra 安装。正解：移除插件 pip_dependencies
+  （插件是 daemon-first 设计，网关 env 不需要 mslm）。
 - ~~42 个 upstream-inherent 失败的 py3.14 环境~~ → **已建**：PM 自带 python 3.14.7
   （`~/.hermes/tools/python-3.14.7+20260901-linux-x64/`），用 uv 建测试 venv
   `/tmp/hermes-test-314`（`uv pip install -e ".[mcp,messaging]" --group dev`；matrix extra
