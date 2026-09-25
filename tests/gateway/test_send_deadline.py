@@ -124,3 +124,91 @@ async def test_deadline_configurable_via_platform_extra():
     result = await adapter._send_with_retry("C1", "hello")
     assert not result.success
     assert "timed out" in (result.error or "").lower()
+
+
+class _ResumingAdapter(_Adapter):  # type: ignore[misc]
+    """Adapter whose first send fails partially and whose resume behavior is injected."""
+
+    def __init__(self, send_fn, resume_fn):
+        super().__init__(send_fn)
+        self._resume_fn = resume_fn
+        self.resume_calls = 0
+
+    async def _resume_partial_send(self, chat_id, result, *, reply_to, metadata):
+        self.resume_calls += 1
+        return await self._resume_fn(chat_id, result, reply_to, metadata)
+
+
+def _partial_failure():
+    """A split send whose head landed but whose tail did not (Telegram shape)."""
+    return SendResult(
+        success=False,
+        error="ConnectionError: reset by peer",
+        retryable=True,
+        raw_response={
+            "partial_overflow": True,
+            "delivered_message_ids": ["m1"],
+            "undelivered_chunks": ["the tail that never landed"],
+            "delivered_chunks": 1,
+            "total_chunks": 2,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_hung_resume_bounded_and_partial_record_preserved():
+    """A black-holed resume (undelivered-tail send that never returns) must be
+    deadline-bounded AND keep the partial-delivery record: the tail's delivery
+    state is unknown, so the result stays partial_overflow-marked — a plain
+    timeout result would let a retry or redelivery re-send the visible head."""
+
+    async def partial_then_ok(chat_id, content, reply_to, metadata):
+        return _partial_failure()
+
+    async def hanging_resume(chat_id, result, reply_to, metadata):
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    adapter = _ResumingAdapter(partial_then_ok, hanging_resume)
+    adapter._send_deadline_override = 0.2
+
+    started = time.monotonic()
+    result = await adapter._send_with_retry("C1", "split payload", base_delay=0.01)
+    elapsed = time.monotonic() - started
+
+    assert not result.success
+    assert elapsed < 5.0
+    # Exactly one first send and one resume attempt — the timeout result must
+    # end the turn instead of triggering another resume (chunks the cancelled
+    # resume delivered would be duplicated by a second attempt).
+    assert adapter.calls == 1
+    assert adapter.resume_calls == 1
+    # The partial record survives the timeout, with the marker for consumers.
+    raw = result.raw_response
+    assert isinstance(raw, dict)
+    assert raw.get("partial_overflow") is True
+    assert raw.get("resume_timed_out") is True
+    assert raw.get("delivered_message_ids") == ["m1"]
+    # Non-retryable and in the timeout channel (no plain-text fallback either).
+    assert result.retryable is False
+    assert BasePlatformAdapter._is_timeout_error(result.error) is True
+    assert BasePlatformAdapter._is_retryable_error(result.error) is False
+
+
+@pytest.mark.asyncio
+async def test_successful_resume_unaffected_by_deadline():
+    """A resume that completes within the deadline keeps its result verbatim."""
+
+    async def partial_first(chat_id, content, reply_to, metadata):
+        return _partial_failure()
+
+    async def completing_resume(chat_id, result, reply_to, metadata):
+        return SendResult(success=True, message_id="m2")
+
+    adapter = _ResumingAdapter(partial_first, completing_resume)
+    adapter._send_deadline_override = 5.0
+
+    result = await adapter._send_with_retry("C1", "split payload", base_delay=0.01)
+    assert result.success
+    assert result.message_id == "m2"
+    assert adapter.resume_calls == 1

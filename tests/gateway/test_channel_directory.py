@@ -395,3 +395,60 @@ class TestChannelAliases:
                  if e["id"] == "120363@g.us"]
         assert names == ["general"]
 
+
+
+class TestReentrancyGate:
+    """The build re-entry gate (ours, kept through the 2026-09-26 upstream merge):
+    build_channel_directory has three trigger sites (startup, adapter connect,
+    housekeeping) and the platform calls inside can be slow — an overlapping
+    build duplicates the work and thrashes DIRECTORY_PATH."""
+
+    @pytest.mark.asyncio
+    async def test_overlapping_build_skipped_and_gate_resets(self, tmp_path):
+        import gateway.channel_directory as cd
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = {"n": 0}
+
+        async def blocking_impl(adapters):
+            calls["n"] += 1
+            started.set()
+            await release.wait()
+            return {"done": True}
+
+        with patch.object(cd, "_build_channel_directory_impl", blocking_impl), \
+             patch.object(cd, "DIRECTORY_PATH", tmp_path / "dir.json"):
+            first = asyncio.create_task(cd.build_channel_directory({}))
+            await asyncio.wait_for(started.wait(), timeout=5)
+
+            # Overlapping call returns {} immediately — without awaiting the
+            # in-flight build and without entering the impl a second time.
+            second = await cd.build_channel_directory({})
+            assert second == {}
+            assert calls["n"] == 1
+            assert not (tmp_path / "dir.json").exists()  # skip path writes nothing
+
+            release.set()
+            first_result = await asyncio.wait_for(first, timeout=5)
+
+        assert first_result == {"done": True}
+        assert calls["n"] == 1
+        assert cd._channel_dir_building is False  # gate reset by finally
+
+    @pytest.mark.asyncio
+    async def test_gate_reset_allows_next_build(self, tmp_path):
+        import gateway.channel_directory as cd
+
+        calls = {"n": 0}
+
+        async def quick_impl(adapters):
+            calls["n"] += 1
+            return {"done": True}
+
+        with patch.object(cd, "_build_channel_directory_impl", quick_impl), \
+             patch.object(cd, "DIRECTORY_PATH", tmp_path / "dir.json"):
+            await cd.build_channel_directory({})
+            await cd.build_channel_directory({})
+
+        assert calls["n"] == 2  # sequential builds both run — the gate is not a mutex leak

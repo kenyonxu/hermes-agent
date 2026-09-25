@@ -3638,7 +3638,34 @@ class BasePlatformAdapter(ABC):
             caller then keeps the partial failure rather than re-sending the already-visible head."""
             if not self._is_partial_delivery(previous):
                 return await _send(content)
-            return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
+            resume = self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
+            deadline = self._send_deadline_seconds()
+            if deadline <= 0:
+                return await resume
+            try:
+                return await asyncio.wait_for(resume, timeout=deadline)
+            except asyncio.TimeoutError:
+                # The partial-delivery record must survive the timeout: the cancelled
+                # resume leaves the tail's delivery unknown, so a plain (non-partial)
+                # timeout result would let a retry or redelivery re-send the whole
+                # payload and duplicate the already-visible head. Keep
+                # partial_overflow in raw_response and phrase the error so the
+                # timeout channel returns it immediately — no second resume, no
+                # plain-text fallback.
+                logger.error(
+                    "[%s] Resume send timed out after %.0fs (chat=%s) — tail delivery "
+                    "unknown; keeping the partial record without re-sending",
+                    self.name, deadline, chat_id,
+                )
+                raw = dict(previous.raw_response) if isinstance(previous.raw_response, dict) else {}
+                raw["partial_overflow"] = True
+                raw["resume_timed_out"] = True
+                return SendResult(
+                    success=False,
+                    error=f"Resume send timed out after {deadline:.0f}s",
+                    retryable=False,
+                    raw_response=raw,
+                )
 
         result = await _send(content)
         if result.success or self._send_retry_is_final(result):

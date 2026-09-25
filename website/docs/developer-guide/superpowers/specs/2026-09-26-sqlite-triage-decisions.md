@@ -191,3 +191,60 @@ supersedes、2 个含 keep 块、1 个 arch-diverged；10 个文件与上游字�
   且本 checkout 无 .venv/venv——与本次取舍无关的 pm 状态问题；运行时验证按计划落在合并
   提交后的 dryrun 全量（Task 5 之后）。
 - 禁 commit/push 遵守：本清单仅 `git add -f` 暂存，提交由 Task 5 统一执行。
+
+---
+
+## 附二：验证与执行记录（合并后补记，2026-09-25 晚）
+
+> 上节"附"写作于冲突解决现场；本节为合并全流程结束后的最终记录，两节并存以保留过程视角。
+> "定向测试本机未能执行"的顾虑已被消除（见下）。
+
+### 全量验证（最终树 e54b5584fa）
+
+- 全量 pytest（canonical runner，`HERMES_PYTHON=miniconda3` 旁路）：5,023 文件 /
+  **51,785 passed / 70 failed** / 644 skipped（3511s，24 workers）。
+- 70 个失败逐文件归因后全部落在 62 文件"归因允许清单"内：42 upstream-inherent（本机
+  py3.13.12 vs 上游运行时硬性 `==3.14.*`，含 nemo-relay 版本锁簇）、12 machine-local（conda
+  变量泄漏 / 代理窗口 / 宿主组件版本；其中 test_failure_writer_ownership 为探针子进程被
+  本机回环代理窗口卡死——探针逻辑 20/20 过，非断言失败）、6 order-dep、2 上游 FLAKY。
+- **生产代码零回归**：合并树相对上游 138e33d51f 的 .py 净差异仅两个 keep 薄层 + 我方独有
+  测试/脚本；keep 层定向测试全绿（send_deadline 5✓、event_loop_blocking 1✓）。
+- 3 个 merge-regression 均为测试侧（取舍只落了生产文件、fork 配对测试未同步），已以提交
+  `e54b5584fa` 同步：scheduler 全取上游、housekeeping 删（上游 test_wal_checkpoint_strategy
+  继任）、shared_session_db 删（上游 test_shared_session_db_registry 18 测试等价更强覆盖）。
+
+### 窗口执行（3 跑 2 回滚）
+
+- run1：`run_tests.sh` 不透传 `--deselect` → 回滚；run2：pip build isolation 经代理拉
+  setuptools 撞 SSL 抖动 → 改 `--no-deps --no-build-isolation` 后回滚；run3：聚焦套件
+  278 文件零失败、合并、editable、冒烟、push origin 成功（`61f4985305..e54b5584fa`）。
+- run3 尾部：重启后 5s 时 unit 尚 activating 被脚本误判 → 本地回滚；手动恢复 main 后撞出
+  **上游 v0.21.x 多路复用模型拒独立 unit（exit 78）**，按官方兼容路径为 zhihui profile 配置
+  `gateway.standalone: true` 后全绿：pid 1093284，code_sha `e54b5584fa`，版本 0.20.6 →
+  **0.21.5**，discord/feishu/api_server 三平台 connected。
+
+### 合并后跟进（已落地部分）
+
+- **Telegram `_resume_partial_send` deadline 包裹**（上游新增路径，我方 send-deadline 治理的
+  最后一个未覆盖分支）：`_send_again` 的 resume 分支现受 `_send_deadline_seconds` 约束；超时
+  结果**保留 partial_overflow 记录**（raw 附 `resume_timed_out` 标记）且错误串走 timeout 通道
+  ——避免 wait_for 取消导致 partial 簿记丢失后、重试/补投整包重发复制已见头部。契约测试
+  `tests/gateway/test_send_deadline.py` 增 resume 悬挂/正常完成两用例（7/7 绿）。
+- **重入闸并发专测**：`tests/gateway/test_channel_directory.py::TestReentrancyGate` ——重叠
+  build 立即返回 `{}`、不进 impl、不写 DIRECTORY_PATH；完成后闸门复位（22/22 绿）。
+- `tests/hermes_state/test_hermes_state.py` 未用 `patch` 导入已删（274 绿）。
+
+### #33159 FD-leak 覆盖：关闭（不补测）
+
+事实核验：上游 `tests/hermes_cli/test_kanban_db.py:1943-1950` 的 #33159 注释块是**孤儿注释**
+（其后无任何 connect_closing 断言用例）；我方被删旧测试也只"文档化泄漏"（docstring 自认
+"upstream behaviour we cannot change"，钉的是 sqlite3 内建 context-manager 不关连接的行为）。
+对他人运行时的固有行为钉不变量属 change-detector，无 Hermes 自有不变量可守——**关闭，不补测**。
+
+### 环境遗留（未根治，影响未来全量的失败底座）
+
+- PM workspace 插件 `hermes-plugin-superlocalmemory` 要求 mslm-memory>=4.1.0 而镜像只有
+  4.0.0（miniconda 已有 4.2.0）→ 凡走 activate 的路径被阻，需 `hermes pm doctor` 根治。
+- 42 个 upstream-inherent 失败的根治 = py3.14 测试环境（上游依赖全标 `>= '3.14'`）。
+- `gateway.standalone: true` 是官方临时 shim，上游移除后需 `hermes gateway migrate
+  --multiplex` 迁移拓扑。
