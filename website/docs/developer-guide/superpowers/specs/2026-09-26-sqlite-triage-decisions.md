@@ -241,10 +241,16 @@ supersedes、2 个含 keep 块、1 个 arch-diverged；10 个文件与上游字�
 "upstream behaviour we cannot change"，钉的是 sqlite3 内建 context-manager 不关连接的行为）。
 对他人运行时的固有行为钉不变量属 change-detector，无 Hermes 自有不变量可守——**关闭，不补测**。
 
-### 环境遗留（未根治，影响未来全量的失败底座）
+### 环境遗留（2026-09-25 深夜更新：前两项已根治）
 
-- PM workspace 插件 `hermes-plugin-superlocalmemory` 要求 mslm-memory>=4.1.0 而镜像只有
-  4.0.0（miniconda 已有 4.2.0）→ 凡走 activate 的路径被阻，需 `hermes pm doctor` 根治。
-- 42 个 upstream-inherent 失败的根治 = py3.14 测试环境（上游依赖全标 `>= '3.14'`）。
+- ~~PM workspace mslm 镜像缺口~~ → **已修**：`hermes pm repair` 重建依赖环境成功，`pm status`
+  显示 sync outcome ok。
+- ~~42 个 upstream-inherent 失败的 py3.14 环境~~ → **已建**：PM 自带 python 3.14.7
+  （`~/.hermes/tools/python-3.14.7+20260901-linux-x64/`），用 uv 建测试 venv
+  `/tmp/hermes-test-314`（`uv pip install -e ".[mcp,messaging]" --group dev`；matrix extra
+  因 python-olm 无 3.14 轮子且源码构建失败而去除）。canary 验证：relay 簇
+  （test_relay_atof_cwd）与 pm 引导族（test_bundle_native 11✓）在该 venv 下全绿。
+  用法：`HERMES_PYTHON=/tmp/hermes-test-314/bin/python3 scripts/run_tests.sh …`（venv 在
+  /tmp，重启即失——建议后续固化到 ~/.hermes/tools 旁并由 CI/脚本重建）。
 - `gateway.standalone: true` 是官方临时 shim，上游移除后需 `hermes gateway migrate
   --multiplex` 迁移拓扑。
