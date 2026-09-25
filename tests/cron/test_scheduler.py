@@ -537,11 +537,7 @@ class TestRunJobSessionPersistence:
         call_args = fake_db.end_session.call_args
         assert call_args[0][0] == original_session_id
         assert call_args[0][1] == "cron_complete"
-        # The shared SessionDB singleton is process-scoped: run_job must NOT
-        # close it per-tick (that would defeat the shared-connection design
-        # and recreate write-lock contention). The process-wide close happens
-        # in gateway shutdown via close_shared_session_db().
-        fake_db.close.assert_not_called()
+        fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
     def test_run_job_disarms_agent_close_after_scheduler_finalizes_session(self, tmp_path):
@@ -768,11 +764,7 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
-        # Shared-session-db semantics (7/23 deadlock fix): run_job does NOT
-        # close the process-wide shared writer — close_shared_session_db()
-        # owns that at shutdown. Per-job close is the upstream per-job design
-        # this fork intentionally diverged from.
-        fake_db.close.assert_not_called()
+        fake_db.close.assert_called_once()
 
     def test_run_job_preserves_slack_origin_thread_for_same_explicit_channel(self, tmp_path, monkeypatch):
         job = {
@@ -832,11 +824,7 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
-        # Shared-session-db semantics (7/23 deadlock fix): run_job does NOT
-        # close the process-wide shared writer — close_shared_session_db()
-        # owns that at shutdown. Per-job close is the upstream per-job design
-        # this fork intentionally diverged from.
-        fake_db.close.assert_not_called()
+        fake_db.close.assert_called_once()
 
     @pytest.mark.parametrize("timeout_value", ["600", "0"])
     def test_run_job_heartbeats_oneshot_claim_in_both_wait_modes(
@@ -1019,11 +1007,7 @@ class TestRunJobSessionPersistence:
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_PLATFORM") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_CHAT_ID") is None
         assert os.getenv("HERMES_CRON_AUTO_DELIVER_THREAD_ID") is None
-        # Shared-session-db semantics (7/23 deadlock fix): run_job does NOT
-        # close the process-wide shared writer per tick — close_shared_session_db()
-        # owns that at shutdown. Upstream per-job design closes per job; this
-        # fork intentionally diverged.
-        assert fake_db.close.call_count == 0
+        assert fake_db.close.call_count == 2
 
 class TestRunJobConfigEnvVarExpansion:
     """Verify that ${VAR} references in config.yaml are expanded when running cron jobs."""
